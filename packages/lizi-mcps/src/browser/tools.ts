@@ -33,6 +33,9 @@ import {
 } from './recipe-loader.js';
 import { runRecipe, findUnsafeEvaluateInterpolations } from './recipe-runner.js';
 import { isHttpUrl } from './url-guard.js';
+import { BrowserExperienceRecorder, suggestRecipes, type ExperienceAction } from './experience.js';
+import { BrowserResultCache, lintBrowserOutput } from './result-cache.js';
+import recipeAuthorRules from './prompts/rules/recipe-author.md?raw';
 
 // Layered registries: bundled L1 (Vite glob, parsed once) merged with the host's
 // optional L2 user layer. Cached and keyed by the L2 `version` fingerprint, so a
@@ -96,6 +99,8 @@ const ACTIONS = [
   'recipe',
   'siteguide',
   'saveRecipe',
+  'recipeHelp',
+  'readResult',
 ] as const;
 
 const ACT_KINDS = [
@@ -279,7 +284,11 @@ function resultText(value: unknown): string {
   // string ~2x the cap for quote-heavy content — defeating this backstop. Size
   // the preview against the FINAL serialized length instead: start optimistic,
   // then shrink by the measured overflow until the whole result fits.
+  const record = value && typeof value === 'object' ? value as Record<string, unknown> : {};
   const base = {
+    ...(typeof record.ok === 'boolean' ? { ok: record.ok } : {}),
+    ...(typeof record.action === 'string' ? { action: record.action } : {}),
+    ...(typeof record.errorCode === 'string' ? { errorCode: record.errorCode } : {}),
     truncated: true as const,
     bytes: json.length,
     limit: MAX_RESULT_BYTES,
@@ -476,15 +485,20 @@ async function screenshotToolResult(
 function toRuntimeRequest(args: Record<string, unknown>): BrowserControlRequest {
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(args)) {
-    if (value !== undefined && key !== 'afterSnapshot') out[key] = value;
+    if (value !== undefined && !['afterSnapshot', 'intent', 'deferValidation', 'resultId', 'offset'].includes(key)) out[key] = value;
   }
   return out as unknown as BrowserControlRequest;
 }
 
 export function registerBrowserTools(registry: BrowserToolRegistry, deps: BrowserMcpDeps): void {
+  const experiences = new BrowserExperienceRecorder();
+  const results = new BrowserResultCache();
+  const discovered = new Map<string, string>();
+  const learningHints = new Set<string>();
+  const textResult = (value: Record<string, unknown>, source?: { profile?: string; targetId?: string }) => resultText(results.digest(value, source));
   // Session-local evidence and repair budget: never share successful trials
   // between agents, and never retain caller inputs or page contents here.
-  const verifiedDrafts = new Map<string, { site: string; content: string }>();
+  const verifiedDrafts = new Map<string, { site: string; content: string; profile: string }>();
   const failedRecipes = new Set<string>();
   const repairUsed = new Set<string>();
   const runningRecipes = new Set<string>();
@@ -523,9 +537,13 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
       '优先使用 snapshot 返回的 ref 执行 click/type/press,不要猜测 CSS selector。' +
       'act/open/navigate/upload 可带 afterSnapshot:{}，一次返回动作结果和精简快照；可用 selector 限定区域。' +
       '注意:直接调用本工具时,wait/evaluate/saveResource 不是顶层 action(会报 INVALID_ARGS),它们只能作为 act 的 request.kind 子操作(配方 steps 里仅 wait/evaluate 是合法 DSL action,saveResource 在配方中同样不可用)。',
-    rules: ['browser-workflow', 'recipe-author'],
+    rules: ['browser-workflow'],
     inputShape: {
       action: z.enum(ACTIONS).describe('浏览器操作类型'),
+      intent: z.string().max(120).optional().describe('open/navigate/siteguide: 可选操作意图，用于本地匹配配方；不会自动执行'),
+      deferValidation: z.boolean().optional().describe('saveRecipe: 将新的只读流程存为候选，下一次真实任务执行时校验；不额外重放当前任务'),
+      resultId: z.string().optional().describe('readResult: 大结果返回的 fullResult.id'),
+      offset: z.number().int().nonnegative().optional().describe('readResult: 原始 JSON 字符偏移'),
       backend: z
         .enum(['external', 'rsb-webview'])
         .optional()
@@ -635,6 +653,24 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
     },
     handler: async (args) => {
       try {
+        if (args.action === 'readResult') {
+          if (!args.resultId) return errorResult(args.action, 'readResult requires resultId');
+          const source = results.source(args.resultId);
+          if (source && deps.pageReadsRestricted && await deps.pageReadsRestricted(source).catch(() => true)) {
+            results.clear();
+            return errorResult(args.action, '该页面处于代输入保护期，已清除缓存；请离开敏感页面后重新只读获取');
+          }
+          const value = results.read(args.resultId, args.offset ?? 0, Math.max(1, Math.min(args.maxChars ?? 12_000, 24_000)));
+          return { content: [{ type: 'text', text: resultText(value) }], isError: !value.ok };
+        }
+        if (args.action === 'recipeHelp') {
+          let observations: unknown[] = [];
+          if (args.site && deps.experienceStore) {
+            try { observations = await deps.experienceStore.list(args.site); } catch { /* Learning is optional. */ }
+          }
+          return { content: [{ type: 'text', text: resultText({ ok: true, action: 'recipeHelp', rules: recipeAuthorRules, observations }) }] };
+        }
+        if (args.deferValidation !== undefined && args.action !== 'saveRecipe') return errorResult(args.action, 'deferValidation 仅用于 saveRecipe');
         if (args.afterSnapshot && (!['act', 'open', 'navigate', 'upload'].includes(args.action)
           || (args.action === 'act' && args.request?.kind === 'close'))) {
           return errorResult(args.action, 'afterSnapshot 仅用于 act（不含 close）、open、navigate、upload');
@@ -647,6 +683,9 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
           }
           if (!deps.setBackend) return errorResult(args.action, '当前宿主不支持切换浏览器模式');
           const backend = await deps.setBackend(args.backend);
+          experiences.clear();
+          discovered.clear();
+          results.clear();
           const ok = backend === args.backend;
           return {
             content: [{
@@ -733,6 +772,7 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
         // recipe: run a declarative per-site flow (composition over primitives).
         // Merged L1 (bundled) + L2 (user); user version shadows builtin by id.
         if (args.action === 'recipe') {
+          experiences.clear(args.targetId ? JSON.stringify([args.profile ?? '', args.targetId]) : undefined);
           let entry: MergedRecipe | undefined;
           const candidate = args.recipeDraft !== undefined;
           if (candidate) {
@@ -747,8 +787,16 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
             entry = (await recipeRegistry(deps)).get(args.recipeId);
           }
           if (!entry) return errorResult('recipe', `unknown recipe: ${args.recipeId}`);
+          if (entry.recipe.validation?.state === 'candidate') {
+            const { validation, ...draft } = entry.recipe;
+            const issue = draftIssue(draft, validation.site);
+            if (issue || draft.access !== 'read') return errorResult('recipe', issue ?? '候选必须是只读流程');
+          }
           const id = entry.recipe.id;
           const persisted = candidate ? (await recipeRegistry(deps)).get(id)?.recipe : entry.recipe;
+          if (persisted?.validation?.profile !== undefined && persisted.validation.profile !== (args.profile ?? '')) {
+            return errorResult('recipe', '配方属于另一浏览器 profile；请显式使用原 profile，或为当前身份重新整理配方');
+          }
           if (runningRecipes.has(id)) return errorResult('recipe', '该配方正在执行，请勿并发重放');
           if (candidate && persisted?.validation && persisted.validation.site !== args.site) {
             return errorResult('recipe', '已有配方的修订必须保存在原站点，请保持相同 site');
@@ -797,7 +845,16 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
           }).finally(() => runningRecipes.delete(id));
           let maintenanceMessage: string | undefined;
           if (runResult.ok && candidate) {
-            verifiedDrafts.set(id, { site: args.site!, content: JSON.stringify(entry.recipe) });
+            verifiedDrafts.set(id, { site: args.site!, content: JSON.stringify(entry.recipe), profile: args.profile ?? '' });
+          } else if (runResult.ok && persisted?.validation?.state === 'candidate' && deps.saveUserRecipe) {
+            // Promotion describes the actual checks on this invocation, not
+            // proof of every possible parameter combination. Never replay it.
+            try {
+              const saved = await deps.saveUserRecipe({ site: persisted.validation.site,
+                recipe: { ...persisted, validation: { ...persisted.validation, state: 'active' } } });
+              if (!saved.ok) maintenanceMessage = '本次执行成功，候选状态保存失败；下次仍会按候选验证。';
+              recipeCache = null;
+            } catch { maintenanceMessage = '本次执行成功，候选状态保存失败；下次仍会按候选验证。'; }
           } else if (!runResult.ok && lastCallDispatched && runResult.failureKind !== 'input' && runResult.failedStep !== undefined) {
             // A failed draft is not evidence that the saved active version is
             // stale. Keep its state, while limiting new/previously failed drafts.
@@ -812,7 +869,7 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
                     .filter((g) => g.guide.recipes?.includes(id)).map((g) => g.guide.site);
                 if (sites.length === 1) {
                   const saved = await deps.saveUserRecipe({ site: sites[0],
-                    recipe: { ...persisted, validation: { site: sites[0], state: 'suspended' } } });
+                    recipe: { ...persisted, validation: { ...persisted.validation, site: sites[0], state: 'suspended' } } });
                   if (!saved.ok) maintenanceMessage = '本任务已暂停；跨任务停用保存失败，请勿复用旧配方。';
                   recipeCache = null;
                 } else maintenanceMessage = '本任务已暂停；无法确定配方所属站点，未保存跨任务停用状态。';
@@ -821,8 +878,10 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
           }
           return {
             content: [
-              { type: 'text', text: resultText({ action: 'recipe', provenance: entry.provenance, ...runResult,
-                ...(!runResult.ok ? { recovery, maintenanceMessage } : candidate ? { verified: true } : {}) }) },
+              { type: 'text', text: textResult({ action: 'recipe', provenance: entry.provenance, ...runResult,
+                ...(maintenanceMessage ? { maintenanceMessage } : {}),
+                ...(runResult.ok && lintBrowserOutput(runResult.output).length ? { advisory: lintBrowserOutput(runResult.output) } : {}),
+                ...(!runResult.ok ? { recovery, maintenanceMessage } : candidate ? { verified: true } : {}) }, { profile: args.profile, targetId: activeTargetId }) },
             ],
             isError: !runResult.ok,
           };
@@ -847,6 +906,10 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
             recipeReg = recipeRegistryFrom(user);
           } catch (err) {
             return errorResult('siteguide', `siteguide registry error: ${err instanceof Error ? err.message : String(err)}`);
+          }
+          if (args.site && args.intent) {
+            return { content: [{ type: 'text', text: resultText({ ok: true, action: 'siteguide',
+              site: args.site, recipes: suggestRecipes(recipeReg, args.site.toLowerCase(), args.intent, args.profile) }) }] };
           }
           const recipeInputsOf = (ids: string[] | undefined, compact = false) =>
             (ids ?? []).map((id) => {
@@ -983,11 +1046,14 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
           const issue = draftIssue(parsed.data, args.site);
           if (issue) return errorResult('saveRecipe', issue);
           const verified = verifiedDrafts.get(parsed.data.id);
-          if (!verified || verified.site !== args.site || verified.content !== JSON.stringify(parsed.data)) {
+          if (args.deferValidation) {
+            if (parsed.data.access !== 'read') return errorResult('saveRecipe', '延后验证仅支持声明为 read 的新流程；写操作沿用当次授权和已执行验证');
+            if ((await recipeRegistry(deps)).has(parsed.data.id)) return errorResult('saveRecipe', '已有配方必须先验证修订，不能被未验证候选覆盖');
+          } else if (!verified || verified.site !== args.site || verified.content !== JSON.stringify(parsed.data) || verified.profile !== (args.profile ?? '')) {
             return errorResult('saveRecipe', '请先用 action=recipe、site、相同 recipeDraft 试跑并通过校验；不能保存未验证或已改动的配方');
           }
           const saved = await deps.saveUserRecipe({ site: args.site,
-            recipe: { ...parsed.data, validation: { site: args.site, state: 'active' } }, siteGuide: guide });
+            recipe: { ...parsed.data, validation: { site: args.site, state: args.deferValidation ? 'candidate' : 'active', profile: args.profile ?? '' } }, siteGuide: guide });
           if (saved.ok) {
             verifiedDrafts.delete(parsed.data.id);
             failedRecipes.delete(parsed.data.id);
@@ -998,7 +1064,7 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
           }
           return {
             content: [
-              { type: 'text', text: resultText({ ok: saved.ok, action: 'saveRecipe', path: saved.path, message: saved.message }) },
+              { type: 'text', text: resultText({ ok: saved.ok, action: 'saveRecipe', state: args.deferValidation ? 'candidate' : 'active', path: saved.path, message: saved.message }) },
             ],
             isError: !saved.ok,
           };
@@ -1088,11 +1154,58 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
         // error so the agent sees + acts on the embedded hint.
         const inner = (result.data as { result?: { ok?: boolean } } | undefined)?.result;
         const extractFailed = args.action === 'extract' && inner?.ok === false;
+        // Optional experience work must never turn a completed action into a
+        // failure (especially a write that the agent might otherwise replay).
+        const targetId = readTargetId(result) ?? args.request?.targetId ?? args.targetId;
+        const targetKey = targetId && JSON.stringify([args.profile ?? '', targetId]);
+        let retainResult = true;
+        try {
+          if (args.action === 'stop') { experiences.clear(); discovered.clear(); results.clear(); }
+          const restricted = deps.pageReadsRestricted && await deps.pageReadsRestricted({ profile: args.profile, targetId }).catch(() => true);
+          if (restricted) { retainResult = false; results.clear(); }
+          if (!result.ok || extractFailed || restricted || args.action === 'close' || args.request?.kind === 'close') {
+            if (targetKey) experiences.clear(targetKey);
+          } else if (args.action === 'open' || args.action === 'navigate') {
+            const actualUrl = (result.data as { url?: unknown } | undefined)?.url;
+            const url = typeof actualUrl === 'string' ? actualUrl : args.url ?? args.targetUrl;
+            if (url) {
+              const site = new URL(url).hostname;
+              if (targetKey) experiences.start(targetKey, url);
+              const user = await resolveUserLayer(deps);
+              const key = JSON.stringify([site, args.profile ?? '', args.intent ?? '']);
+              const version = user?.version ?? '';
+              if (discovered.get(key) !== version) {
+                const suggestions = suggestRecipes(recipeRegistryFrom(user), site, args.intent, args.profile);
+                if (discovered.size >= 64) discovered.delete(discovered.keys().next().value!);
+                discovered.set(key, version);
+                if (suggestions.length) result = { ...result, recipeSuggestions: suggestions } as typeof result;
+              }
+            }
+          } else if (targetKey && deps.experienceStore) {
+            const kind = args.action === 'extract' ? 'extract' : args.action === 'act' ? args.request?.kind : undefined;
+            if (kind && ['click', 'type', 'select', 'press', 'wait', 'extract', 'evaluate'].includes(kind)) {
+              const observation = experiences.step(targetKey, kind as ExperienceAction);
+              if (observation && inner?.ok !== false) {
+                const saved = await deps.experienceStore.record(observation);
+                const hintKey = JSON.stringify([saved.site, saved.actions]);
+                if (saved.observations >= 2 && !learningHints.has(hintKey)) {
+                  if (learningHints.size >= 64) learningHints.delete(learningHints.values().next().value!);
+                  learningHints.add(hintKey);
+                  result = { ...result, learningOpportunity: { site: saved.site, observations: saved.observations,
+                    hint: '相同操作形状已重复出现（不代表业务相同）。若预计还会使用且没有合适配方，用 recipeHelp 按当前成功步骤整理；可保存候选，等下一次真实任务验证。偶发操作无需学习。' } } as typeof result;
+                }
+              }
+            }
+          }
+        } catch { /* Structural hints are best effort; the operation result wins. */ }
+        const advisory = lintBrowserOutput((result.data as { result?: unknown } | undefined)?.result);
+        if (advisory.length) result = { ...result, advisory } as typeof result;
         return {
-          content: [{ type: 'text', text: resultText(result) }],
+          content: [{ type: 'text', text: retainResult ? textResult(result as unknown as Record<string, unknown>, { profile: args.profile, targetId }) : resultText(result) }],
           isError: !result.ok || extractFailed,
         };
       } catch (err) {
+        experiences.clear();
         deps.logger?.warn?.('browser runtime call failed', {
           message: err instanceof Error ? err.message : String(err),
         });

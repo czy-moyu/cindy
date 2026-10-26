@@ -648,6 +648,8 @@ export interface ResolvedBrowserScreenshot {
 
 /** Browser automation MCP host deps. Core browser execution is injected by host. */
 export interface BrowserMcpDeps {
+  /** Local structural observations only; no URLs, scripts, selectors or input values. */
+  experienceStore?: import('./browser/experience.js').BrowserExperienceStore;
   getRuntime(): BrowserControlRuntime;
   /**
    * Resolve a successful screenshot runtime result into verified image bytes.

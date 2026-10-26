@@ -90,7 +90,9 @@ export const RecipeSchema = z.object({
   /** Host-owned state; authored drafts cannot supply this. Legacy files remain runnable. */
   validation: z.object({
     site: z.string(),
-    state: z.enum(['active', 'suspended']),
+    state: z.enum(['candidate', 'active', 'suspended']),
+    /** Newly learned recipes stay in their browser profile; legacy files omit it. */
+    profile: z.string().optional(),
   }).optional(),
 }).refine(recipe => recipe.adapter ? recipe.steps.length === 0 : recipe.steps.length > 0, 'recipe requires steps or a bundled adapter, exclusively');
 

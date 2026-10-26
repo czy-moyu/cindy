@@ -24,8 +24,9 @@ import { genericOAuthSecretIo } from '../secrets/providerSecretStore.js';
 import { createRecipeFileBroker } from './browser-backend/rsb-webview-upload-policy.js';
 import { artifactSessionRoot } from './browser-backend/rsb-webview-artifacts.js';
 import { extractBrowserAvailability, type BrowserAvailability } from './browser-availability.js';
-import { loadUserBrowserRecipes, type UserRecipesResult } from '../browser-recipes/loader.js';
+import { loadUserBrowserRecipes, userRecipesDir, type UserRecipesResult } from '../browser-recipes/loader.js';
 import { writeUserRecipe, type WriteUserRecipeResult } from '../browser-recipes/writer.js';
+import { browserExperienceStore } from '../browser-recipes/experience.js';
 import {
   BrowserBackendController,
   BrowserBackendHealthService,
@@ -461,6 +462,7 @@ function browserRecipeSecretId(key: string): string {
 }
 
 export function getBrowserMcpDeps(): {
+  experienceStore: NonNullable<BrowserMcpDeps['experienceStore']>;
   getRuntime(): BrowserControlRuntime;
   resolveScreenshot: NonNullable<BrowserMcpDeps['resolveScreenshot']>;
   compressInlineImage: NonNullable<BrowserMcpDeps['compressInlineImage']>;
@@ -475,6 +477,7 @@ export function getBrowserMcpDeps(): {
   pageReadsRestricted(target: { profile?: string; targetId?: string }): Promise<boolean>;
 } {
   return {
+    experienceStore: browserExperienceStore(userRecipesDir()),
     recipeFiles: async (sessionId) => {
       const sessionRoots = sessionId ? await resolveSessionUploadRoots(sessionId) : [];
       const roots = sessionId ? [

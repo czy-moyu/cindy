@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 
 import { createBrowserMcpServer } from './server.js';
 import { INLINE_IMAGE_TARGET_BYTES, type BrowserMcpDeps } from '../types.js';
+import type { Recipe } from './recipe-loader.js';
 
 // `respond` lets a test script the result per call (e.g. a navigate that returns
 // a swapped targetId); default echoes the request back as data.
@@ -41,6 +42,177 @@ async function makeHarness(
     },
   };
 }
+
+// New behavior through the public MCP boundary (unit): automatic discovery,
+// structural repetition, candidate lifecycle and recoverable result summaries.
+// Existing tests covered explicit siteguide/validated saves, not these paths.
+describe('browser experience cache', () => {
+  async function invoke(h: Awaited<ReturnType<typeof makeHarness>>, args: Record<string, unknown>) {
+    const r = await h.client.callTool({ name: 'call_tool', arguments: { name: 'browser', args } });
+    return JSON.parse((r.content as Array<{ text: string }>)[0].text);
+  }
+  const draft: Recipe = { id: 'experience-search', access: 'read', match: ['experience.test'], description: 'Search books',
+    inputs: { query: { required: true } }, steps: [{ action: 'evaluate', fn: '() => ({title: "found"})',
+      guard: { url: 'https://experience.test/' }, expect: { requiredFields: ['title'] }, as: 'items' }], output: '{{items}}' };
+
+  it('suggests matching recipes with navigation once per catalog version, without executing them', async () => {
+    let version = 0;
+    const stored = { ...draft, validation: { site: 'experience.test', state: 'active' as const, profile: '' } };
+    const h = await makeHarness({ getUserRecipes: async () => ({ version: `experience-discovery-${version}`,
+      recipes: new Map([[stored.id, stored]]), siteGuides: new Map() }) }, () => ({ targetId: 'tab' }));
+    try {
+      const open = { action: 'navigate', url: 'https://experience.test/', intent: 'Search' };
+      expect((await invoke(h, open)).recipeSuggestions[0]).toMatchObject({ id: draft.id, access: 'read' });
+      expect((await invoke(h, open)).recipeSuggestions).toBeUndefined();
+      version++;
+      expect((await invoke(h, open)).recipeSuggestions).toHaveLength(1);
+      expect((await invoke(h, { ...open, url: 'https://experience.test.evil/' })).recipeSuggestions).toBeUndefined();
+      expect((await invoke(h, { ...open, profile: 'another-account' })).recipeSuggestions).toBeUndefined();
+      expect((await invoke(h, { ...open, intent: 'unrelated' })).recipeSuggestions).toBeUndefined();
+      expect(h.calls).toHaveLength(6);
+      expect(h.calls.every(req => (req as { action: string }).action === 'navigate')).toBe(true);
+      expect(h.calls[0]).not.toHaveProperty('intent');
+    } finally { await h.cleanup(); }
+  });
+
+  it('records only structural steps and hints on repetition; errors and protected pages do not learn', async () => {
+    const recorded: unknown[] = [];
+    let restricted = false;
+    let failed = false;
+    const h = await makeHarness({
+      experienceStore: { list: async () => [], record: async input => {
+        recorded.push(input); return { ...input, observations: recorded.length, updatedAt: 1 };
+      } },
+      pageReadsRestricted: async () => restricted,
+    }, () => ({ targetId: 'tab', result: failed ? { ok: false } : { title: 'private-result' } }));
+    try {
+      const read = { action: 'act', targetId: 'tab', request: { kind: 'evaluate', fn: '() => "private-script"' } };
+      for (let i = 0; i < 2; i++) {
+        await invoke(h, { action: 'navigate', url: 'https://experience.test/private-path?token=secret' });
+        await invoke(h, { action: 'act', targetId: 'tab', request: { kind: 'type', selector: '#private-selector', text: 'private-input' } });
+        const result = await invoke(h, read);
+        expect(Boolean(result.learningOpportunity)).toBe(i === 1);
+      }
+      expect(recorded).toEqual(Array.from({ length: 2 }, () => ({ site: 'experience.test', actions: ['navigate', 'type', 'evaluate'] })));
+      await invoke(h, { action: 'navigate', url: 'https://experience.test/' });
+      failed = true;
+      await invoke(h, read);
+      failed = false;
+      await invoke(h, read);
+      expect(recorded).toHaveLength(2);
+      restricted = true;
+      await invoke(h, { action: 'navigate', url: 'https://experience.test/' });
+      await invoke(h, read);
+      expect(recorded).toHaveLength(2);
+    } finally { await h.cleanup(); }
+  });
+
+  it('persists a read candidate without replay and promotes it on a later real invocation', async () => {
+    let stored: Recipe | undefined;
+    let version = 0;
+    const deps: Partial<BrowserMcpDeps> = {
+      getUserRecipes: async () => ({ version: `experience-candidate-${version}`, recipes: new Map(stored ? [[stored.id, stored]] : []), siteGuides: new Map() }),
+      saveUserRecipe: async ({ recipe }) => { stored = recipe; version++; return { ok: true }; },
+    };
+    const h = await makeHarness(deps);
+    try {
+      expect(await invoke(h, { action: 'saveRecipe', site: 'experience.test', recipeDraft: draft, deferValidation: true })).toMatchObject({ ok: true, state: 'candidate' });
+      expect(h.calls).toHaveLength(0);
+      expect(stored?.validation?.state).toBe('candidate');
+      expect((await invoke(h, { action: 'saveRecipe', site: 'experience.test', recipeDraft: draft, deferValidation: true })).ok).toBe(false);
+      expect((await invoke(h, { action: 'saveRecipe', site: 'experience.test', recipeDraft: { ...draft, id: 'write', access: 'write' }, deferValidation: true })).ok).toBe(false);
+    } finally { await h.cleanup(); }
+    const next = await makeHarness(deps, (_req, i) => ({ result: i === 0 ? true : { title: 'found' } }));
+    try {
+      expect((await invoke(next, { action: 'recipe', recipeId: draft.id, profile: 'other', inputs: { query: 'book' } })).ok).toBe(false);
+      expect((await invoke(next, { action: 'recipe', recipeId: draft.id })).ok).toBe(false);
+      expect(next.calls).toHaveLength(0);
+      expect((await invoke(next, { action: 'recipe', recipeId: draft.id, inputs: { query: 'book' } })).output).toEqual({ title: 'found' });
+      expect(next.calls).toHaveLength(2);
+      expect(stored?.validation?.state).toBe('active');
+    } finally { await next.cleanup(); }
+  });
+
+  it.each(['guard', 'save'] as const)('keeps candidate %s failures honest without replay', async failure => {
+    let stored: Recipe = { ...draft, validation: { site: 'experience.test', state: 'candidate', profile: '' } };
+    const h = await makeHarness({
+      getUserRecipes: async () => ({ version: `experience-failure-${failure}`, recipes: new Map([[stored.id, stored]]), siteGuides: new Map() }),
+      saveUserRecipe: async ({ recipe }) => { if (failure === 'save') throw new Error('disk full'); stored = recipe; return { ok: true }; },
+    }, (_req, i) => ({ result: i === 0 ? failure !== 'guard' : { title: 'found' } }));
+    try {
+      const result = await invoke(h, { action: 'recipe', recipeId: draft.id, inputs: { query: 'book' } });
+      if (failure === 'guard') {
+        expect(result.ok).toBe(false);
+        expect(stored.validation?.state).toBe('suspended');
+        expect((await invoke(h, { action: 'recipe', recipeId: draft.id, inputs: { query: 'book' } })).ok).toBe(false);
+        expect(h.calls).toHaveLength(1);
+      } else {
+        expect(result.ok).toBe(true);
+        expect(result.maintenanceMessage).toContain('保存失败');
+        expect(stored.validation?.state).toBe('candidate');
+        expect(h.calls).toHaveLength(2);
+      }
+    } finally { await h.cleanup(); }
+  });
+
+  it('reconstructs a large result byte-for-byte without replay, and blocks cached reads after secret handoff', async () => {
+    let restricted = false;
+    const original = { ok: true, action: 'act' as const, data: { targetId: 'tab', result: Array.from({ length: 200 }, (_, i) => ({ title: `item-${i}`, body: '引号"\\'.repeat(40) })) } };
+    const h = await makeHarness({ getRuntime: () => ({ call: async () => original }), pageReadsRestricted: async () => restricted });
+    try {
+      const result = await invoke(h, { action: 'act', targetId: 'tab', request: { kind: 'evaluate', fn: '() => []' } });
+      expect(JSON.stringify(result).length).toBeLessThan(10_000);
+      const id = result.fullResult.id;
+      let offset: number | null = 0;
+      let text = '';
+      while (offset !== null) {
+        const chunk = await invoke(h, { action: 'readResult', resultId: id, offset, maxChars: 12_000 });
+        text += chunk.text; offset = chunk.nextOffset;
+      }
+      expect(JSON.parse(text)).toEqual(original);
+      const other = await makeHarness({ getRuntime: () => ({ call: async () => original }) });
+      try {
+        await invoke(other, { action: 'act', request: { kind: 'evaluate', fn: '() => []' } });
+        // A stale reference must not silently resolve to a new session's first result.
+        expect((await invoke(other, { action: 'readResult', resultId: id })).ok).toBe(false);
+      } finally { await other.cleanup(); }
+      restricted = true;
+      expect((await invoke(h, { action: 'readResult', resultId: id })).ok).toBe(false);
+      restricted = false;
+      expect((await invoke(h, { action: 'readResult', resultId: id })).ok).toBe(false);
+    } finally { await h.cleanup(); }
+  });
+
+  it('evicts old originals and preserves success with advisory warnings or failed experience storage', async () => {
+    let big = true;
+    const h = await makeHarness({
+      experienceStore: { list: async () => [], record: async () => { throw new Error('disk full'); } },
+    }, () => ({ targetId: 'tab', result: big ? 'x'.repeat(17_000) : [{ title: '', body: '<div>raw</div>' }, { title: '', body: '<div>raw</div>' }] }));
+    try {
+      const read = { action: 'act', targetId: 'tab', request: { kind: 'evaluate', fn: '() => []' } };
+      const first = await invoke(h, read);
+      for (let i = 0; i < 4; i++) await invoke(h, read);
+      expect((await invoke(h, { action: 'readResult', resultId: first.fullResult.id })).ok).toBe(false);
+      big = false;
+      await invoke(h, { action: 'navigate', url: 'https://experience.test/' });
+      const result = await invoke(h, read);
+      expect(result.ok).toBe(true);
+      expect(result.advisory).toEqual(expect.arrayContaining(['duplicate_records', 'empty_fields', 'markup']));
+      expect(result.learningOpportunity).toBeUndefined();
+    } finally { await h.cleanup(); }
+  });
+
+  it('reports successful oversized actions honestly when the full result exceeds the retention budget', async () => {
+    const h = await makeHarness({}, () => ({ blob: 'x'.repeat(2_000_001) }));
+    try {
+      const result = await invoke(h, { action: 'act', request: { kind: 'evaluate', fn: '() => []' } });
+      expect(result).toMatchObject({ ok: true, action: 'act', truncated: true });
+      expect(result.fullResult).toBeUndefined();
+      expect(JSON.stringify(result).length).toBeLessThanOrEqual(200_000);
+      expect(h.calls).toHaveLength(1);
+    } finally { await h.cleanup(); }
+  });
+});
 
 describe('createBrowserMcpServer', () => {
   // Historical form replay spent a second model call on every post-click read.
@@ -222,10 +394,13 @@ describe('createBrowserMcpServer', () => {
     };
     expect(parsed.ok).toBe(true);
     // the `browser` tool references the rule keys…
-    expect(parsed.tools.find((t) => t.name === 'browser')?.rules).toEqual(['browser-workflow', 'recipe-author']);
+    expect(parsed.tools.find((t) => t.name === 'browser')?.rules).toEqual(['browser-workflow']);
     // …and each full markdown body is bundled once at the top level.
     expect(parsed.rules?.['browser-workflow']).toContain('snapshot');
-    expect(parsed.rules?.['recipe-author']).toContain('saveRecipe');
+    expect(parsed.rules?.['recipe-author']).toBeUndefined();
+    const help = await h.client.callTool({ name: 'call_tool', arguments: { name: 'browser', args: { action: 'recipeHelp' } } });
+    expect(JSON.parse((help.content as Array<{ text: string }>)[0].text).rules).toContain('saveRecipe');
+    expect(h.calls).toHaveLength(0);
     await h.cleanup();
   });
 
@@ -887,11 +1062,14 @@ describe('createBrowserMcpServer', () => {
     });
     const parsed = JSON.parse((result.content as Array<{ text: string }>)[0].text) as {
       truncated?: boolean;
-      bytes?: number;
-      limit?: number;
+      fullResult: { id: string; chars: number };
     };
     expect(parsed.truncated).toBe(true);
-    expect(parsed.bytes ?? 0).toBeGreaterThan(parsed.limit ?? 0);
+    expect(parsed.fullResult.chars).toBeGreaterThan(300_000);
+    const read = await h.client.callTool({ name: 'call_tool', arguments: { name: 'browser', args: { action: 'readResult', resultId: parsed.fullResult.id, offset: 0, maxChars: 1000 } } });
+    const original = JSON.parse((read.content as Array<{ text: string }>)[0].text);
+    expect(original.text).toContain('"blob":"xxxx');
+    expect(original.nextOffset).toBe(1000);
     await h.cleanup();
   });
 
