@@ -55,6 +55,89 @@ describe('browser experience cache', () => {
     inputs: { query: { required: true } }, steps: [{ action: 'evaluate', fn: '() => ({title: "found"})',
       guard: { url: 'https://experience.test/' }, expect: { requiredFields: ['title'] }, as: 'items' }], output: '{{items}}' };
 
+  // Review regression, unit/MCP entry: omitted and explicit profile names must
+  // refer to the same host identity; changing the default must not widen scope.
+  it.each([true, false])('binds learned recipes to the resolved host profile (deferred=%s)', async deferred => {
+    let profile = 'Cindy';
+    let stored: Recipe | undefined;
+    let version = 0;
+    const h = await makeHarness({
+      resolveProfile: requested => requested || profile,
+      getUserRecipes: async () => ({ version: `resolved-profile-${deferred}-${version}`,
+        recipes: new Map(stored ? [[stored.id, stored]] : []), siteGuides: new Map() }),
+      saveUserRecipe: async ({ recipe }) => { stored = recipe; version++; return { ok: true }; },
+    }, (_req, i) => ({ targetId: 'tab', result: i % 2 === 0 ? true : { title: 'found' } }));
+    try {
+      if (!deferred) {
+        expect((await invoke(h, { action: 'recipe', site: 'experience.test', recipeDraft: draft,
+          inputs: { query: 'book' } })).verified).toBe(true);
+        profile = 'Cindy-real';
+        expect((await invoke(h, { action: 'saveRecipe', site: 'experience.test', recipeDraft: draft })).ok).toBe(false);
+        profile = 'Cindy';
+      }
+      expect((await invoke(h, { action: 'saveRecipe', site: 'experience.test', recipeDraft: draft,
+        profile: 'Cindy', deferValidation: deferred })).ok).toBe(true);
+      expect(stored?.validation?.profile).toBe('Cindy');
+      expect((await invoke(h, { action: 'siteguide', site: 'experience.test', intent: 'Search' })).recipes).toHaveLength(1);
+      profile = 'Cindy-real';
+      expect((await invoke(h, { action: 'siteguide', site: 'experience.test', intent: 'Search' })).recipes).toHaveLength(0);
+      const count = h.calls.length;
+      expect((await invoke(h, { action: 'recipe', recipeId: draft.id, inputs: { query: 'book' } })).ok).toBe(false);
+      expect(h.calls).toHaveLength(count);
+      expect((await invoke(h, { action: 'recipe', recipeId: draft.id, profile: 'Cindy', inputs: { query: 'book' } })).ok).toBe(true);
+      expect(h.calls.slice(-2).every(req => (req as { profile: string }).profile === 'Cindy')).toBe(true);
+    } finally { await h.cleanup(); }
+  });
+
+  // Review regression, unit/MCP entry: another task/Settings can change the
+  // shared host while this tool is idle or awaiting a protected-page check.
+  it.each(['idle', 'preflight', 'inflight'] as const)('invalidates original results after an external backend change (%s)', async timing => {
+    let scope = { lifecycle: {}, backend: {} };
+    let switchOnCheck = false;
+    const deps: Partial<BrowserMcpDeps> = {
+      getBackendScope: () => scope,
+      pageReadsRestricted: async () => { if (switchOnCheck) scope = { ...scope, lifecycle: {} }; return false; },
+    };
+    const h = await makeHarness(deps, () => {
+      if (timing === 'inflight') scope = { ...scope, lifecycle: {} };
+      return { targetId: 'tab', result: 'x'.repeat(17_000) };
+    });
+    try {
+      const result = await invoke(h, { action: 'act', targetId: 'tab', request: { kind: 'evaluate', fn: '() => []' } });
+      if (timing === 'inflight') {
+        expect(result.ok).toBe(true);
+        expect(result.fullResult).toBeUndefined();
+      } else {
+        expect(result.fullResult).toBeDefined();
+        if (timing === 'idle') scope = { ...scope, lifecycle: {} };
+        else switchOnCheck = true;
+        expect((await invoke(h, { action: 'readResult', resultId: result.fullResult.id })).ok).toBe(false);
+        switchOnCheck = false;
+        expect((await invoke(h, { action: 'readResult', resultId: result.fullResult.id })).ok).toBe(false);
+      }
+      expect(h.calls).toHaveLength(1);
+    } finally { await h.cleanup(); }
+  });
+
+  it('rejects a backend change during recipe preflight without dispatch or suspension', async () => {
+    let scope = { lifecycle: {}, backend: {} };
+    const stored = { ...draft, validation: { site: 'experience.test', state: 'active' as const } };
+    let saves = 0;
+    const h = await makeHarness({
+      getBackendScope: () => scope,
+      pageReadsRestricted: async () => { scope = { ...scope, backend: {} }; return false; },
+      getUserRecipes: async () => ({ version: 'backend-preflight-rejection', recipes: new Map([[stored.id, stored]]), siteGuides: new Map() }),
+      saveUserRecipe: async () => { saves++; return { ok: true }; },
+    });
+    try {
+      const result = await invoke(h, { action: 'recipe', recipeId: draft.id, inputs: { query: 'book' } });
+      expect(result.ok).toBe(false);
+      expect(h.calls).toHaveLength(0);
+      expect(saves).toBe(0);
+      expect(stored.validation.state).toBe('active');
+    } finally { await h.cleanup(); }
+  });
+
   it('suggests matching recipes with navigation once per catalog version, without executing them', async () => {
     let version = 0;
     const stored = { ...draft, validation: { site: 'experience.test', state: 'active' as const, profile: '' } };

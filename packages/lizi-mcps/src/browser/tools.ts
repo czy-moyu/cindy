@@ -127,10 +127,10 @@ function readsPageState(request: BrowserControlRequest): boolean {
   return request.action === 'act' && (act?.kind === 'evaluate' || (act?.kind === 'wait' && act.fn !== undefined));
 }
 
-function getRuntime(deps: BrowserMcpDeps, onDispatch?: () => void): BrowserControlRuntime {
+function getRuntime(deps: BrowserMcpDeps, onDispatch?: () => void, scopeIsCurrent?: () => boolean): BrowserControlRuntime {
   const runtime = deps.getRuntime();
   const restricted = deps.pageReadsRestricted;
-  if (!restricted && !onDispatch) return runtime;
+  if (!restricted && !onDispatch && !scopeIsCurrent) return runtime;
   // Every path (tool actions, extract, recipes, hints) goes through this check.
   return {
     call: async (request) => {
@@ -149,6 +149,10 @@ function getRuntime(deps: BrowserMcpDeps, onDispatch?: () => void): BrowserContr
       }
       // This is the sole boundary after host preflight and before execution;
       // callers must count attempts here, including throws/timeouts afterwards.
+      if (scopeIsCurrent && !scopeIsCurrent()) return {
+        ok: false, action: request.action, errorCode: 'BROWSER_RUNTIME_INVALID_REQUEST',
+        message: '浏览器后端已切换；请重新观察当前页面后再操作，不要重放写操作。',
+      };
       onDispatch?.();
       return runtime.call(request);
     },
@@ -502,6 +506,19 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
   const failedRecipes = new Set<string>();
   const repairUsed = new Set<string>();
   const runningRecipes = new Set<string>();
+  let backendScope = deps.getBackendScope?.();
+  function syncBackendScope() {
+    const next = deps.getBackendScope?.();
+    if (next?.lifecycle !== backendScope?.lifecycle || next?.backend !== backendScope?.backend) {
+      experiences.clear();
+      discovered.clear();
+      learningHints.clear();
+      results.clear();
+      verifiedDrafts.clear();
+      backendScope = next;
+    }
+    return backendScope;
+  }
   const recovery = '先重新观察当前页面；当前任务每个配方最多验证一轮修订。失败后回普通操作。写操作先核实是否已成功，不得自动重放。';
   function draftIssue(recipe: Recipe, site: string | undefined): string | undefined {
     if (recipe.validation) return 'validation 由宿主管理，recipeDraft 不得提供';
@@ -653,6 +670,10 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
     },
     handler: async (args) => {
       try {
+        const scope = syncBackendScope();
+        const scopeIsCurrent = () => syncBackendScope() === scope;
+        const profile = deps.resolveProfile?.(args.profile);
+        if (profile !== undefined) args = { ...args, profile };
         if (args.action === 'readResult') {
           if (!args.resultId) return errorResult(args.action, 'readResult requires resultId');
           const source = results.source(args.resultId);
@@ -660,6 +681,7 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
             results.clear();
             return errorResult(args.action, '该页面处于代输入保护期，已清除缓存；请离开敏感页面后重新只读获取');
           }
+          scopeIsCurrent(); // A switch during the async restriction check expires originals too.
           const value = results.read(args.resultId, args.offset ?? 0, Math.max(1, Math.min(args.maxChars ?? 12_000, 24_000)));
           return { content: [{ type: 'text', text: resultText(value) }], isError: !value.ok };
         }
@@ -720,7 +742,7 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
           }
         }
         let onRecipeDispatch: (() => void) | undefined;
-        const runtime = getRuntime(deps, () => onRecipeDispatch?.());
+        const runtime = getRuntime(deps, () => onRecipeDispatch?.(), scopeIsCurrent);
         // Block non-web schemes at the boundary: navigate/open to file:// /
         // chrome:// / data: would let the agent reach local files or browser
         // internals. Only the scheme is constrained — localhost/private HTTP
@@ -844,7 +866,10 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
             logger: deps.logger,
           }).finally(() => runningRecipes.delete(id));
           let maintenanceMessage: string | undefined;
-          if (runResult.ok && candidate) {
+          const contextCurrent = scopeIsCurrent();
+          if (runResult.ok && !contextCurrent) {
+            maintenanceMessage = '本次执行成功，但浏览器后端已切换；未保留试跑凭证或更新配方状态，不要重放动作。';
+          } else if (runResult.ok && candidate) {
             verifiedDrafts.set(id, { site: args.site!, content: JSON.stringify(entry.recipe), profile: args.profile ?? '' });
           } else if (runResult.ok && persisted?.validation?.state === 'candidate' && deps.saveUserRecipe) {
             // Promotion describes the actual checks on this invocation, not
@@ -855,7 +880,7 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
               if (!saved.ok) maintenanceMessage = '本次执行成功，候选状态保存失败；下次仍会按候选验证。';
               recipeCache = null;
             } catch { maintenanceMessage = '本次执行成功，候选状态保存失败；下次仍会按候选验证。'; }
-          } else if (!runResult.ok && lastCallDispatched && runResult.failureKind !== 'input' && runResult.failedStep !== undefined) {
+          } else if (contextCurrent && !runResult.ok && lastCallDispatched && runResult.failureKind !== 'input' && runResult.failedStep !== undefined) {
             // A failed draft is not evidence that the saved active version is
             // stale. Keep its state, while limiting new/previously failed drafts.
             if (!candidate || !persisted || suspended) failedRecipes.add(id);
@@ -878,10 +903,10 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
           }
           return {
             content: [
-              { type: 'text', text: textResult({ action: 'recipe', provenance: entry.provenance, ...runResult,
+              { type: 'text', text: (scopeIsCurrent() ? textResult : resultText)({ action: 'recipe', provenance: entry.provenance, ...runResult,
                 ...(maintenanceMessage ? { maintenanceMessage } : {}),
                 ...(runResult.ok && lintBrowserOutput(runResult.output).length ? { advisory: lintBrowserOutput(runResult.output) } : {}),
-                ...(!runResult.ok ? { recovery, maintenanceMessage } : candidate ? { verified: true } : {}) }, { profile: args.profile, targetId: activeTargetId }) },
+                ...(!runResult.ok ? { recovery, maintenanceMessage } : candidate ? { verified: contextCurrent } : {}) }, { profile: args.profile, targetId: activeTargetId }) },
             ],
             isError: !runResult.ok,
           };
@@ -1052,6 +1077,7 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
           } else if (!verified || verified.site !== args.site || verified.content !== JSON.stringify(parsed.data) || verified.profile !== (args.profile ?? '')) {
             return errorResult('saveRecipe', '请先用 action=recipe、site、相同 recipeDraft 试跑并通过校验；不能保存未验证或已改动的配方');
           }
+          if (!scopeIsCurrent()) return errorResult('saveRecipe', '浏览器后端已切换，请重新核对配方适用范围后保存');
           const saved = await deps.saveUserRecipe({ site: args.site,
             recipe: { ...parsed.data, validation: { site: args.site, state: args.deferValidation ? 'candidate' : 'active', profile: args.profile ?? '' } }, siteGuide: guide });
           if (saved.ok) {
@@ -1158,12 +1184,12 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
         // failure (especially a write that the agent might otherwise replay).
         const targetId = readTargetId(result) ?? args.request?.targetId ?? args.targetId;
         const targetKey = targetId && JSON.stringify([args.profile ?? '', targetId]);
-        let retainResult = true;
+        let retainResult = scopeIsCurrent();
         try {
           if (args.action === 'stop') { experiences.clear(); discovered.clear(); results.clear(); }
           const restricted = deps.pageReadsRestricted && await deps.pageReadsRestricted({ profile: args.profile, targetId }).catch(() => true);
           if (restricted) { retainResult = false; results.clear(); }
-          if (!result.ok || extractFailed || restricted || args.action === 'close' || args.request?.kind === 'close') {
+          if (!scopeIsCurrent() || !result.ok || extractFailed || restricted || args.action === 'close' || args.request?.kind === 'close') {
             if (targetKey) experiences.clear(targetKey);
           } else if (args.action === 'open' || args.action === 'navigate') {
             const actualUrl = (result.data as { url?: unknown } | undefined)?.url;
@@ -1201,7 +1227,7 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
         const advisory = lintBrowserOutput((result.data as { result?: unknown } | undefined)?.result);
         if (advisory.length) result = { ...result, advisory } as typeof result;
         return {
-          content: [{ type: 'text', text: retainResult ? textResult(result as unknown as Record<string, unknown>, { profile: args.profile, targetId }) : resultText(result) }],
+          content: [{ type: 'text', text: retainResult && scopeIsCurrent() ? textResult(result as unknown as Record<string, unknown>, { profile: args.profile, targetId }) : resultText(result) }],
           isError: !result.ok || extractFailed,
         };
       } catch (err) {

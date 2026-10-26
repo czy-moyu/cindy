@@ -45,6 +45,11 @@ export class BrowserBackendController implements BrowserBackend {
     return this.router.getCurrentBackendKind();
   }
 
+  /** Reuse existing lifecycle references; no second generation counter or queue. */
+  getBackendScope(): { lifecycle: object; backend: object } {
+    return { lifecycle: this.transition, backend: this.router.getBackendIdentity() };
+  }
+
   probeActiveControl(options?: { ensureHost?: boolean }): Promise<void> {
     return this.router.probeActiveControl(options);
   }

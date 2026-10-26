@@ -50,7 +50,9 @@ try {
   const { registerBrowserTools: registerBaseline } = await baselineVite.ssrLoadModule(
     '/packages/lizi-mcps/src/browser/tools.ts',
   );
-  const { BrowserToolRegistry } = await moduleAt('packages/lizi-mcps/src/browser/tool-registry.ts');
+  const { BrowserToolRegistry } = await moduleAt(
+    'packages/lizi-mcps/src/browser/tool-registry.ts',
+  );
   const { RecipeSchema } = await vite.ssrLoadModule(
     '/packages/lizi-mcps/src/browser/recipe-loader.ts',
   );
@@ -72,7 +74,9 @@ try {
         enabled: true,
         attachOnly: true,
         defaultProfile: 'experience-live',
-        profiles: { 'experience-live': { cdpUrl, attachOnly: true, color: '#00D9C5' } },
+        profiles: {
+          'experience-live': { cdpUrl, attachOnly: true, color: '#00D9C5' },
+        },
         ssrfPolicy: { dangerouslyAllowPrivateNetwork: true },
       },
     },
@@ -152,10 +156,18 @@ try {
   };
 
   const url = 'https://itch.io/search?q=sokoban';
-  const opened = await call('automatic-discovery', { action: 'navigate', url, intent: 'search' });
+  const opened = await call('automatic-discovery', {
+    action: 'navigate',
+    url,
+    intent: 'search',
+  });
   assert(opened.result.recipeSuggestions.some((recipe) => recipe.id === 'itch-search'));
   assert.equal(opened.runtime.length, 1);
-  const again = await call('discovery-cache', { action: 'navigate', url, intent: 'search' });
+  const again = await call('discovery-cache', {
+    action: 'navigate',
+    url,
+    intent: 'search',
+  });
   assert.equal(again.result.recipeSuggestions, undefined);
   report.checks.discoveryWithoutExtraBrowserCall = true;
 
@@ -259,12 +271,16 @@ try {
       ? { author: 'J.K. Rowling', tag: 'choices' }
       : { author: 'Albert Einstein', tag: 'learning' };
     let read;
-    for (const step of draft.steps) read = await call(`observe-${i}`, stepToRequest(step, inputs));
+    for (const step of draft.steps)
+      read = await call(`observe-${i}`, stepToRequest(step, inputs));
     assert.equal(read.result.data.result.matched, true);
     if (i === 1) assert(read.result.learningOpportunity);
   }
   report.checks.repetitionAcrossToolSessions = true;
-  await call('learn-help', { action: 'recipeHelp', site: 'quotes.toscrape.com' });
+  await call('learn-help', {
+    action: 'recipeHelp',
+    site: 'quotes.toscrape.com',
+  });
   const save = await call('learn-candidate', {
     action: 'saveRecipe',
     site: 'quotes.toscrape.com',
@@ -389,16 +405,32 @@ try {
   report.error = err.stack ?? String(err);
   process.exitCode = 1;
 } finally {
-  await fs.writeFile(output, JSON.stringify(report, null, 2));
-  await disconnect?.();
-  await vite?.close();
-  await baselineVite?.close();
-  await fs.rm(temp, { recursive: true, force: true });
+  // Reporting and every cleanup are independent: one failure must not leak
+  // the remaining connection, Vite server or temporary candidate directory.
+  const cleanupErrors = [];
+  for (const clean of [
+    () => fs.writeFile(output, JSON.stringify(report, null, 2)),
+    () => disconnect?.(),
+    () => vite?.close(),
+    () => baselineVite?.close(),
+    () => fs.rm(temp, { recursive: true, force: true }),
+  ]) {
+    try {
+      await clean();
+    } catch (err) {
+      cleanupErrors.push(String(err));
+    }
+  }
+  if (cleanupErrors.length) {
+    process.exitCode = 1;
+    report.cleanupErrors = cleanupErrors;
+  }
   console.log(
     JSON.stringify({
       output,
       checks: report.checks,
       error: report.error,
+      cleanupErrors: report.cleanupErrors,
       calls: report.calls.length,
     }),
   );

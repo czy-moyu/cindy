@@ -67,6 +67,7 @@ import {
   readCopiedLoginsCdpPort,
   wrapRuntimeWithRealProfile,
   wrapRuntimeWithProfileLifecycleQueue,
+  activeManagedProfileName,
 } from './browser-real-profile/index.js';
 import { assertTrustedAppRendererEvent } from '../security/trustedAppRenderer.js';
 import { createBrowserBackendIpcHandlers } from './browser-backend/settings-ipc.js';
@@ -464,6 +465,8 @@ function browserRecipeSecretId(key: string): string {
 export function getBrowserMcpDeps(): {
   experienceStore: NonNullable<BrowserMcpDeps['experienceStore']>;
   getRuntime(): BrowserControlRuntime;
+  resolveProfile: NonNullable<BrowserMcpDeps['resolveProfile']>;
+  getBackendScope: NonNullable<BrowserMcpDeps['getBackendScope']>;
   resolveScreenshot: NonNullable<BrowserMcpDeps['resolveScreenshot']>;
   compressInlineImage: NonNullable<BrowserMcpDeps['compressInlineImage']>;
   setBackend(kind: BackendKind): Promise<BackendKind>;
@@ -506,6 +509,9 @@ export function getBrowserMcpDeps(): {
     // the backend split. Swapping the active backend (Phase 5) is invisible from
     // @cindy/mcps' perspective.
     getRuntime: () => backendController,
+    resolveProfile: (profile) => backendController.kind === 'rsb-webview'
+      ? 'rsb' : profile || activeManagedProfileName(readBrowserBackendSettings().useRealProfile),
+    getBackendScope: () => backendController.getBackendScope(),
     resolveScreenshot: (result) =>
       resolveBrowserScreenshot(result, {
         runtimeDir: process.env.XDT_BROWSER_RUNTIME_DIR,

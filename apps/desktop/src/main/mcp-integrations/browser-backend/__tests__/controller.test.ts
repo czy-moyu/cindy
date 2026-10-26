@@ -32,6 +32,33 @@ function fakeBackend(kind: BackendKind): BrowserBackend & {
 }
 
 describe('BrowserBackendController', () => {
+  // Review regression, unit: cached page evidence must expire both when a
+  // transition is admitted and when its backend actually becomes active.
+  it('exposes stable scope identities across queued, applied and return transitions', async () => {
+    const external = fakeBackend('external');
+    let release!: () => void;
+    const controller = new BrowserBackendController({
+      initialKind: 'external', externalBackend: external,
+      createRsbBackend: () => fakeBackend('rsb-webview'), logger: fakeLogger(),
+    });
+    const initial = controller.getBackendScope();
+    expect(controller.getBackendScope()).toEqual(initial);
+    const changed = controller.setKind('rsb-webview', () => new Promise<void>(resolve => { release = resolve; }));
+    const queued = controller.getBackendScope();
+    expect(queued.lifecycle).not.toBe(initial.lifecycle);
+    expect(queued.backend).toBe(initial.backend);
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    release();
+    await changed;
+    const applied = controller.getBackendScope();
+    expect(applied.lifecycle).toBe(queued.lifecycle);
+    expect(applied.backend).not.toBe(queued.backend);
+    await controller.setKind('external');
+    const returned = controller.getBackendScope();
+    expect(returned.backend).toBe(initial.backend);
+    expect(returned.lifecycle).not.toBe(initial.lifecycle);
+  });
+
   it('serializes reset cleanup after outgoing profile disposal without deadlocking', async () => {
     const queue = createBrowserProfileLifecycleQueue();
     const external = fakeBackend('external');
