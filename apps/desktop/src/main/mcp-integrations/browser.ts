@@ -447,7 +447,9 @@ async function applyBrowserUseRealProfile(enabled: boolean): Promise<boolean> {
 }
 
 export function setBrowserUseRealProfile(enabled: boolean): Promise<boolean> {
-  return browserProfileLifecycleQueue.run(() => applyBrowserUseRealProfile(enabled));
+  return backendController.runLifecycle(() =>
+    browserProfileLifecycleQueue.run(() => applyBrowserUseRealProfile(enabled)),
+  );
 }
 
 /**
