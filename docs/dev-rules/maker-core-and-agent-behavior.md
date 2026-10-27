@@ -84,7 +84,10 @@ Codex code mode 下脚本在后台运行，模型同时继续回应；app-server
 的厂商令牌与私钥、截断私钥块、URL 内嵌凭证、命令行凭证参数、凭证类 HTTP 头，最后以
 含字母和数字的 32 位以上连续串兜底，宁可多删），再截断到每段 400 字符，最后改写分隔标签；
 顺序不能颠倒，否则跨截断点的凭证会留下认不出的前缀。走共享辅助模型链，回答只接受
-CONTINUE / STOP。供应商分享的受邀者会话（Claude Code 在分享者电脑上运行）与分享者自己的
+CONTINUE / STOP。自动辅助链没有任何可用候选（`no_candidate`，如停用了 Cindy AI、只连了自己的
+模型账号）时，改用被复核任务自己的模型路线（会话来源 + 模型）复核，证据本就出自该路线；
+自定义或环境变量辅助链保持 fail-closed，候选失败／超时不换路线重发（#6929：停用 Cindy AI
+的用户此前复核从未发生，疑似一律中断）。供应商分享的受邀者会话（Claude Code 在分享者电脑上运行）与分享者自己的
 任务一样，交分享者电脑的辅助模型链复核（2026-10-13 用户裁决，见 `provider-sharing.md` §9）；
 Pi / Codex 的检测在任务所在电脑的 Session 上，用的是受邀者自己的复核入口。
 回归见 `loop-guard.test.ts`、`tool-loop-review.test.ts`、`session.tool-loop.test.ts`、

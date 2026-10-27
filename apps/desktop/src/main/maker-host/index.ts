@@ -251,6 +251,7 @@ import { claudeSubagentUsageBridge } from './claude-subagent-usage-bridge.js';
 import { createAutoPermissionReviewer } from './auto-permission-reviewer.js';
 import { createToolLoopReviewer } from './tool-loop-reviewer.js';
 import { createCustomAutoReviewFallback, requestUtilityText } from '../utility-model/oneShotCandidates.js';
+import { getEffectiveAuxiliaryModelChain } from '../utility-model/resolveAuxiliaryModelChain.js';
 import {
   AUTO_REVIEW_ROUTER_GUARD_TIMEOUT_MS,
   createAutoReviewModelRouter,
@@ -467,9 +468,25 @@ export const reviewAutoPermissionAction: AutoReviewDelegate = createAutoPermissi
   resolveRequestTimeoutMs: () => AUTO_REVIEW_ROUTER_GUARD_TIMEOUT_MS,
   requestText: (_request, prompt, { signal }) => requestAutoReviewText(prompt, signal),
 });
-/** 工具循环疑似命中时走共享辅助模型链复核;Claude Code 与 Pi/Codex 共用。 */
+/**
+ * 工具循环疑似命中时走共享辅助模型链复核;Claude Code 与 Pi/Codex 共用。自动链没有可用候选
+ * (停用了 Cindy AI 等)时改走被复核任务自己的模型路线,否则复核形同虚设、疑似一律中断;
+ * 自定义/环境变量链是明确的路由决定,保持 fail-closed(与自动起标题同口径)。
+ */
 const reviewToolLoop = createToolLoopReviewer({
   requestText: (prompt, opts) => requestUtilityText(getMaker(), prompt, opts),
+  requestSessionRouteText: (request, prompt, opts) => {
+    if (getEffectiveAuxiliaryModelChain().source !== 'auto') return null;
+    const ownerScope = activeOwnerScopeKey();
+    const providerId = getSessionProvider(request.sessionId);
+    return requestUtilityText(getMaker(), prompt, {
+      ...opts,
+      agentKind: request.agentKind,
+      model: request.model,
+      ...(providerId ? { providerId } : {}),
+      beforeDispatch: async () => !isAppSessionBoundaryPending() && activeOwnerScopeKey() === ownerScope,
+    });
+  },
 });
 
 reviewAutoPermissionAction.prepareRequest = async request => {

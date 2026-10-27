@@ -210,4 +210,29 @@ describe('tool loop reviewer', () => {
     const unparseable = createToolLoopReviewer({ requestText: vi.fn(async () => okResult('not sure')) });
     await expect(unparseable(request, { signal: new AbortController().signal })).resolves.toBe('stop');
   });
+
+  // 停用 Cindy AI 后自动辅助链全部 no_candidate:复核从未真正发生,疑似一律中断(#6929)。
+  it('reviews on the task route only when the auxiliary chain has no candidate', async () => {
+    const noCandidate = async (): Promise<UtilityTextResult> => ({ ok: false, reason: 'no_candidate', attempts: [] });
+    const signal = new AbortController().signal;
+    const sessionRoute = vi.fn(async () => okResult('CONTINUE'));
+    const reviewer = createToolLoopReviewer({ requestText: vi.fn(noCandidate), requestSessionRouteText: sessionRoute });
+    await expect(reviewer(request, { signal })).resolves.toBe('continue');
+    expect(sessionRoute).toHaveBeenCalledWith(request, expect.stringContaining('<tool_calls>'), expect.objectContaining({
+      systemPrompt: TOOL_LOOP_REVIEW_SYSTEM_PROMPT,
+      signal,
+    }));
+
+    const disallowed = createToolLoopReviewer({ requestText: vi.fn(noCandidate), requestSessionRouteText: () => null });
+    await expect(disallowed(request, { signal })).resolves.toBe('stop');
+
+    // 链上有候选但调用失败:不换路线重发。
+    const chainFailed = vi.fn(async () => okResult('CONTINUE'));
+    const failing = createToolLoopReviewer({
+      requestText: vi.fn(async (): Promise<UtilityTextResult> => ({ ok: false, reason: 'all_candidates_failed', attempts: [] })),
+      requestSessionRouteText: chainFailed,
+    });
+    await expect(failing(request, { signal })).resolves.toBe('stop');
+    expect(chainFailed).not.toHaveBeenCalled();
+  });
 });

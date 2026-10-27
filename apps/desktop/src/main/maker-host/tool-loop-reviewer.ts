@@ -3,8 +3,8 @@
  *
  * maker-core 的 ToolLoopGuard 只看工具 trace,分不清"等外部进度的轮询"和"原地空转"。
  * 疑似命中后,maker-core 通过注入的 ToolLoopReviewer 把最近的调用摘要交给共享辅助
- * 模型链判断。这里只负责脱敏、组 prompt、发请求、解析一个词的结论;任何失败都回 stop,
- * 与未接入复核前的行为一致。
+ * 模型链判断(链上没有可用候选时由 host 决定是否改走任务自己的模型路线)。这里只负责脱敏、
+ * 组 prompt、发请求、解析一个词的结论;任何失败都回 stop,与未接入复核前的行为一致。
  */
 
 import type {
@@ -43,7 +43,18 @@ type RequestText = (
 ) => ReturnType<typeof requestUtilityText>;
 
 interface ToolLoopReviewerDeps {
+  /** 共享辅助模型链。 */
   requestText: RequestText;
+  /**
+   * 辅助模型链没有任何可用候选(no_candidate,例如停用了 Cindy AI、只连了自己的模型账号)时,
+   * 改用被复核任务自己的模型路线;证据本就出自这条路线,不会送往新的服务方。
+   * 返回 null = 不允许回落,按 stop 处理。
+   */
+  requestSessionRouteText?: (
+    request: ToolLoopReviewRequest,
+    prompt: string,
+    opts: Parameters<RequestText>[1],
+  ) => ReturnType<RequestText> | null;
 }
 
 /** URL 中内嵌的凭证(scheme://user:pass@host、scheme://token@host)。 */
@@ -168,7 +179,8 @@ export function parseToolLoopReviewDecision(text: string): ToolLoopReviewDecisio
 
 export function createToolLoopReviewer(deps: ToolLoopReviewerDeps): ToolLoopReviewer {
   return async (request, { signal }) => {
-    const result = await deps.requestText(buildToolLoopReviewPrompt(request), {
+    const prompt = buildToolLoopReviewPrompt(request);
+    const opts: Parameters<RequestText>[1] = {
       maxTokens: TOOL_LOOP_REVIEW_MAX_TOKENS,
       timeoutMs: TOOL_LOOP_REVIEW_TIMEOUT_MS,
       disableReasoning: true,
@@ -176,7 +188,12 @@ export function createToolLoopReviewer(deps: ToolLoopReviewerDeps): ToolLoopRevi
       systemPrompt: TOOL_LOOP_REVIEW_SYSTEM_PROMPT,
       responseInstructions: RESPONSE_INSTRUCTIONS,
       validateResponse: (text) => parseToolLoopReviewDecision(text) !== null,
-    });
+    };
+    let result = await deps.requestText(prompt, opts);
+    // 只在“链上一个可用模型都没有”时回落;候选失败/超时说明链本身可用,不换路线重发。
+    if (!result.ok && result.reason === 'no_candidate' && !signal.aborted) {
+      result = await deps.requestSessionRouteText?.(request, prompt, opts) ?? result;
+    }
     if (!result.ok) return 'stop';
     return parseToolLoopReviewDecision(result.text) ?? 'stop';
   };
