@@ -199,7 +199,7 @@ pnpm --filter @cindy/browser-control-runtime test    # 契约 + SSRF guard
 
 ### 配方按使用维护与等待条件（2026-10-23）
 
-- `recipe` 支持 `site + recipeDraft` 内存试跑；`saveRecipe` 通常接受同一 MCP 会话已通过验证的相同内容与 profile。声明 read 且仅含 navigate、无 fn 的 wait、extract、requests、responseBody 的新流程可用 `deferValidation:true` 保存 candidate（不能覆盖已有 id），下一次真实任务显式执行且 guard/expect 全部通过后转为 active；交互、任意脚本和 adapter 须当次真实操作验证，不能只信 access 标签。保存、发现、执行旧 candidate 共用 `deferredRecipeIssue` 判据；不承诺远端 GET 没有业务副作用，现有逐次审批仍适用。状态写入失败保留本次执行成功，不能重放。active 不证明未测参数组合。正常检查不请求模型，不定时后台刷新；失败交给当前任务模型观察、同 id 一轮修订，失败回普通操作。修复预算为会话内状态，MCP 会话重建后重新计数；暂停状态写进配方，跨重启保留。
+- `recipe` 支持 `site + recipeDraft` 内存试跑；`saveRecipe` 通常接受同一 MCP 会话已通过验证的相同内容与 profile。声明 read 且仅含 navigate、无 fn 的 wait、extract、requests、responseBody 的新流程可用 `deferValidation:true` 保存 candidate（不能覆盖已有 id）。下一次真实执行且 guard/expect 全部通过后仅返回 verified、保留会话内凭证；沿用显式 saveRecipe 启用，不重复试跑。候选执行成功或失败都不回写旧定义，避免覆盖其它任务的新修订；失败只暂停本任务，下个任务仍须验证。不新增锁或版本更新协议。交互、任意脚本和 adapter 须当次真实操作验证，不能只信 access 标签。保存、发现、执行旧 candidate 共用 `deferredRecipeIssue` 判据；不承诺远端 GET 没有业务副作用，现有逐次审批仍适用。状态写入失败保留本次执行成功，不能重放。active 不证明未测参数组合。正常检查不请求模型，不定时后台刷新；失败交给当前任务模型观察、同 id 一轮修订，失败回普通操作。修复预算为会话内状态，MCP 会话重建后重新计数；已启用或旧配方沿用原有持久暂停，跨重启保留。
 - 新保存配方的交互/读取步骤须有完整 URL 和可选唯一可见 CSS 元素/文本 `guard`；末步 `expect` 检查数量、必需顶层字段与业务值。extract 将 guard 与读取合成同一次 evaluate；写动作前独立 guard，不能把它当事务或幂等保证。工具不重放步骤，后置失败须先核对写入是否已成功。
 - 本地每站 `recipes/<id 的 SHA-256>.json` 支持多个流程，原子替换复用 Desktop 工具；loader 兼容 `recipe.json`、新文件优先。旧配方保留执行兼容，实际失败后暂停；新建/修订必须经过新验证。失败不把候选覆盖到正式配方。跨任务并发修改同一配方仍是最后写入优先，不新增锁/版本管理系统。
 - `wait.fn` 补丁在 `sync.mjs`：host 只编译函数，页面执行；传真实 function 给 `waitForFunction`，避免函数源码被当 truthy、重复 eval 被 Trusted Types 拦截。timeout 放第三参数。异步 predicate 明确拒绝，避免 Promise 假成功；evaluate 仍支持 async。

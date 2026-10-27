@@ -222,7 +222,38 @@ describe('browser experience cache', () => {
     } finally { await h.cleanup(); }
   });
 
-  it('persists a read candidate without replay and promotes it on a later real invocation', async () => {
+  // Review regression, unit/MCP entry: a candidate finishing after another
+  // task's validated save must not overwrite that revision. Existing lifecycle
+  // tests ran only one tool instance and could not expose the stale write.
+  it.each([true, false])('keeps another task\'s newer revision when an older candidate finishes (ok=%s)', async ok => {
+    let stored: Recipe = { ...readDraft, validation: { site: 'experience.test', state: 'candidate' } };
+    let saves = 0;
+    let entered!: () => void;
+    let release!: () => void;
+    const dispatched = new Promise<void>(resolve => { entered = resolve; });
+    const finish = new Promise<void>(resolve => { release = resolve; });
+    const deps: Partial<BrowserMcpDeps> = {
+      getUserRecipes: async () => ({ version: `interleaved-candidate-${ok}-${saves}`, recipes: new Map([[stored.id, stored]]), siteGuides: new Map() }),
+      saveUserRecipe: async ({ recipe }) => { stored = recipe; saves++; return { ok: true }; },
+    };
+    const oldTask = await makeHarness({ ...deps, getRuntime: () => ({
+      call: async req => { entered(); await finish; return { ok: true, action: req.action, data: { result: { matched: ok, value: extracted } } }; },
+    }) });
+    const newTask = await makeHarness(deps, () => ({ result: { matched: true, value: extracted } }));
+    const pending = invoke(oldTask, { action: 'recipe', recipeId: readDraft.id, inputs: { query: 'book' } });
+    try {
+      await dispatched;
+      const revised: Recipe = { ...readDraft, steps: readDraft.steps.map(step => ({ ...step, extract: { fields: { title: 'h2' } } })) };
+      expect((await invoke(newTask, { action: 'recipe', site: 'experience.test', recipeDraft: revised, inputs: { query: 'book' } })).verified).toBe(true);
+      expect((await invoke(newTask, { action: 'saveRecipe', site: 'experience.test', recipeDraft: revised })).ok).toBe(true);
+      release();
+      expect((await pending).ok).toBe(ok);
+      expect(stored.steps).toEqual(revised.steps);
+      expect(saves).toBe(1);
+    } finally { release(); await pending; await oldTask.cleanup(); await newTask.cleanup(); }
+  });
+
+  it('validates a read candidate on later real use and enables it only on explicit save without replay', async () => {
     const draft = readDraft;
     let stored: Recipe | undefined;
     let version = 0;
@@ -243,9 +274,12 @@ describe('browser experience cache', () => {
       expect((await invoke(next, { action: 'recipe', recipeId: draft.id, profile: 'other', inputs: { query: 'book' } })).ok).toBe(false);
       expect((await invoke(next, { action: 'recipe', recipeId: draft.id })).ok).toBe(false);
       expect(next.calls).toHaveLength(0);
-      expect((await invoke(next, { action: 'recipe', recipeId: draft.id, inputs: { query: 'book' } })).output).toEqual(extracted);
+      expect(await invoke(next, { action: 'recipe', recipeId: draft.id, inputs: { query: 'book' } })).toMatchObject({ output: extracted, verified: true });
       expect(next.calls).toHaveLength(1);
+      expect(stored?.validation?.state).toBe('candidate');
+      expect((await invoke(next, { action: 'saveRecipe', site: 'experience.test', recipeDraft: draft })).ok).toBe(true);
       expect(stored?.validation?.state).toBe('active');
+      expect(next.calls).toHaveLength(1);
     } finally { await next.cleanup(); }
   });
 
@@ -260,12 +294,13 @@ describe('browser experience cache', () => {
       const result = await invoke(h, { action: 'recipe', recipeId: draft.id, inputs: { query: 'book' } });
       if (failure === 'guard') {
         expect(result.ok).toBe(false);
-        expect(stored.validation?.state).toBe('suspended');
+        expect(stored.validation?.state).toBe('candidate');
         expect((await invoke(h, { action: 'recipe', recipeId: draft.id, inputs: { query: 'book' } })).ok).toBe(false);
         expect(h.calls).toHaveLength(1);
       } else {
-        expect(result.ok).toBe(true);
-        expect(result.maintenanceMessage).toContain('保存失败');
+        expect(result).toMatchObject({ ok: true, verified: true });
+        expect(result.maintenanceMessage).toBeUndefined();
+        expect((await invoke(h, { action: 'saveRecipe', site: 'experience.test', recipeDraft: draft })).ok).toBe(false);
         expect(stored.validation?.state).toBe('candidate');
         expect(h.calls).toHaveLength(1);
       }

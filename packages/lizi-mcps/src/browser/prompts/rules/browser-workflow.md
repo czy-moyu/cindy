@@ -63,7 +63,7 @@
 7. 任务完成后,可用不带 `proxyServer` 的 `{action:"start"}` 明确恢复普通直连模式。代理 A 切代理 B、代理切直连都会重启浏览器;重复同一代理则保持当前进程。
 
 #### Token 效率(按"最省 → 兜底"的顺序选路)
-1. **优先复用配方**: `open/navigate` 会随结果给出最多三个本地 `recipeSuggestions`，可带简短 `intent` 收窄；同任务相同站点/意图且目录未变不重复提示，不另起模型请求。自行判断业务、账号与参数是否适用，再显式 `recipe(recipeId,inputs)`；候选会在本次真实执行通过校验后转为 active。已知 id 直接复用，无须先导航或查目录。缺少合适候选时可用 `siteguide` + `site` 看完整站点指南，不要默认加载全部目录；`siteguide` 不是网站的 sitemap.xml。
+1. **优先复用配方**: `open/navigate` 会随结果给出最多三个本地 `recipeSuggestions`，可带简短 `intent` 收窄；同任务相同站点/意图且目录未变不重复提示，不另起模型请求。自行判断业务、账号与参数是否适用，再显式 `recipe(recipeId,inputs)`；候选在真实执行通过校验后返回 `verified:true`，需启用时用 `saveRecipe` 保存同一草稿，不重复试跑。已知 id 直接复用，无须先导航或查目录。缺少合适候选时可用 `siteguide` + `site` 看完整站点指南，不要默认加载全部目录；`siteguide` 不是网站的 sitemap.xml。
 2. **数据型页面优先读接口,别扒 DOM**:很多列表 / 详情背后是 JSON API,读接口比扒渲染后的 DOM 又稳又省。
    - ① `action: "requests"`(带**具体** `filter`,如 `/api/quotes`;别用太宽的 `api`,会撞 `fonts.googleapis.com` 之类)看页面发了哪些 XHR/fetch、拿到接口 URL。这是读**已发生**请求的清单。
    - ② 读 body:**GET 接口最稳的姿势是直接 `navigate` 到该 URL**,再用 `extract`(`fields:{ data:"body" }`)或 snapshot 读返回的 JSON。

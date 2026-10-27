@@ -817,6 +817,7 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
           }
           const id = entry.recipe.id;
           const persisted = candidate ? (await recipeRegistry(deps)).get(id)?.recipe : entry.recipe;
+          const verifyingDraft = candidate || entry.recipe.validation?.state === 'candidate';
           if (persisted?.validation?.profile !== undefined && persisted.validation.profile !== (args.profile ?? '')) {
             return errorResult('recipe', '配方属于另一浏览器 profile；请显式使用原 profile，或为当前身份重新整理配方');
           }
@@ -870,23 +871,19 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
           const contextCurrent = scopeIsCurrent();
           if (runResult.ok && !contextCurrent) {
             maintenanceMessage = '本次执行成功，但浏览器后端已切换；未保留试跑凭证或更新配方状态，不要重放动作。';
-          } else if (runResult.ok && candidate) {
-            verifiedDrafts.set(id, { site: args.site!, content: JSON.stringify(entry.recipe), profile: args.profile ?? '' });
-          } else if (runResult.ok && persisted?.validation?.state === 'candidate' && deps.saveUserRecipe) {
-            // Promotion describes the actual checks on this invocation, not
-            // proof of every possible parameter combination. Never replay it.
-            try {
-              const saved = await deps.saveUserRecipe({ site: persisted.validation.site,
-                recipe: { ...persisted, validation: { ...persisted.validation, state: 'active' } } });
-              if (!saved.ok) maintenanceMessage = '本次执行成功，候选状态保存失败；下次仍会按候选验证。';
-              recipeCache = null;
-            } catch { maintenanceMessage = '本次执行成功，候选状态保存失败；下次仍会按候选验证。'; }
+          } else if (runResult.ok && verifyingDraft) {
+            // Reuse explicit saveRecipe after validation. Successful execution
+            // must not write an old snapshot over another task's newer revision.
+            const { validation, ...draft } = entry.recipe;
+            verifiedDrafts.set(id, { site: args.site ?? validation!.site, content: JSON.stringify(draft), profile: args.profile ?? '' });
           } else if (contextCurrent && !runResult.ok && lastCallDispatched && runResult.failureKind !== 'input' && runResult.failedStep !== undefined) {
             // A failed draft is not evidence that the saved active version is
             // stale. Keep its state, while limiting new/previously failed drafts.
             if (!candidate || !persisted || suspended) failedRecipes.add(id);
-            // Only failure while using the saved definition can suspend it on disk.
-            if (!candidate && persisted && deps.saveUserRecipe) {
+            // Unenabled candidates only pause this task. Preserve the existing
+            // disk suspension of active/legacy recipes, never write a candidate
+            // snapshot back after either success or failure.
+            if (!verifyingDraft && persisted && deps.saveUserRecipe) {
               try {
                 // Bundled recipes predate validation metadata; their guide
                 // supplies the owning site. Never guess from a host substring.
@@ -907,7 +904,7 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
               { type: 'text', text: (scopeIsCurrent() ? textResult : resultText)({ action: 'recipe', provenance: entry.provenance, ...runResult,
                 ...(maintenanceMessage ? { maintenanceMessage } : {}),
                 ...(runResult.ok && lintBrowserOutput(runResult.output).length ? { advisory: lintBrowserOutput(runResult.output) } : {}),
-                ...(!runResult.ok ? { recovery, maintenanceMessage } : candidate ? { verified: contextCurrent } : {}) }, { profile: args.profile, targetId: activeTargetId }) },
+                ...(!runResult.ok ? { recovery, maintenanceMessage } : verifyingDraft ? { verified: contextCurrent } : {}) }, { profile: args.profile, targetId: activeTargetId }) },
             ],
             isError: !runResult.ok,
           };

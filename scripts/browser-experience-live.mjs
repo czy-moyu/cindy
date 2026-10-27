@@ -278,6 +278,14 @@ try {
   assert.equal(use.result.ok, true);
   assert.equal(use.result.output.records.length, 2);
   assert(use.result.output.records.every((row) => row.text && row.author));
+  assert.equal(use.result.verified, true);
+  assert.equal((await readRecipes()).get(draft.id).validation.state, 'candidate');
+  const enable = await call('candidate-enable', {
+    action: 'saveRecipe',
+    site: 'quotes.toscrape.com',
+    recipeDraft: draft,
+  });
+  assert.equal(enable.runtime.length, 0);
   assert.equal((await readRecipes()).get(draft.id).validation.state, 'active');
   report.checks.candidateSavedWithoutReplayAndPromotedNextSession = true;
   report.experiences = await store.list('quotes.toscrape.com');
@@ -305,7 +313,7 @@ try {
     true,
   );
   assert.equal(failed.result.failureKind, 'guard');
-  assert.equal((await readRecipes()).get(broken.id).validation.state, 'suspended');
+  assert.equal((await readRecipes()).get(broken.id).validation.state, 'candidate');
   await call('repair-observe', {
     action: 'snapshot',
     selector: 'body',
