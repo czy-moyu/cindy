@@ -219,61 +219,40 @@ try {
 
   // A separate public flow has no bundled recipe: observe twice across fresh
   // MCP instances. Both use the same real host experience file.
-  const quoteUrl = 'https://quotes.toscrape.com/search.aspx';
-  const filterUrl = 'https://quotes.toscrape.com/filter.aspx';
-  // Selectors were observed in the preceding public-site experiment. Check
-  // the selected values and every quote rather than treating clicks as proof.
+  const quoteUrl = 'https://quotes.toscrape.com/page/{{page}}/';
+  // Deferred candidates compose known read primitives, not authored JS or
+  // form interactions. Selectors were observed on this public listing.
   const draft = {
-    id: 'live-quote-search',
+    id: 'live-quote-list',
     access: 'read',
     match: ['quotes.toscrape.com'],
-    description: '按作者和标签查询语录',
-    inputs: { author: { required: true }, tag: { required: true } },
+    description: '分页读取公开语录',
+    inputs: { page: { required: true } },
     steps: [
       { action: 'navigate', url: quoteUrl },
-      { action: 'wait', selector: '#author', timeoutMs: 10000 },
       {
-        action: 'select',
-        selector: '#author',
-        values: ['{{author}}'],
-        guard: { url: quoteUrl, selector: '#author' },
-      },
-      {
-        action: 'wait',
-        fn: "() => location.pathname === '/filter.aspx' && document.querySelector('#author')?.value === '{{author|js}}' && [...(document.querySelector('#tag')?.options || [])].some(o=>o.value === '{{tag|js}}')",
-        timeoutMs: 10000,
-      },
-      {
-        action: 'select',
-        selector: '#tag',
-        values: ['{{tag}}'],
-        guard: { url: filterUrl, selector: '#tag' },
-      },
-      {
-        action: 'click',
-        selector: "input[name='submit_button']",
-        guard: { url: filterUrl, selector: "input[name='submit_button']" },
-      },
-      { action: 'wait', selector: '.results .quote', timeoutMs: 10000 },
-      {
-        action: 'evaluate',
-        guard: { url: filterUrl, selector: '.results' },
-        fn: "() => { const author=document.querySelector('#author').value, tag=document.querySelector('#tag').value; const rows=[...document.querySelectorAll('.results .quote')].map(q=>({text:q.querySelector('.content').textContent.trim(),author:q.querySelector('.author').textContent.trim(),tag:q.querySelector('.tag').textContent.trim()})); return {author,tag,rows,matched:author==='{{author|js}}' && tag==='{{tag|js}}' && rows.length>0 && rows.every(r=>r.author===author && r.tag===tag)}; }",
+        action: 'extract',
+        extract: {
+          from: '.quote',
+          multiple: true,
+          limit: 2,
+          fields: { text: '.text', author: '.author' },
+        },
+        guard: { url: quoteUrl, selector: 'body' },
         as: 'result',
-        expect: { equals: { matched: true } },
+        expect: { minCount: 2, requiredFields: ['text', 'author'] },
       },
     ],
     output: '{{result}}',
   };
   for (let i = 0; i < 2; i++) {
     registry = fresh();
-    const inputs = i
-      ? { author: 'J.K. Rowling', tag: 'choices' }
-      : { author: 'Albert Einstein', tag: 'learning' };
+    const inputs = { page: i + 1 };
     let read;
     for (const step of draft.steps)
       read = await call(`observe-${i}`, stepToRequest(step, inputs));
-    assert.equal(read.result.data.result.matched, true);
+    assert.equal(read.result.data.result.records.length, 2);
+    assert(read.result.data.result.records.every((row) => row.text && row.author));
     if (i === 1) assert(read.result.learningOpportunity);
   }
   report.checks.repetitionAcrossToolSessions = true;
@@ -290,15 +269,15 @@ try {
   assert.equal(save.result.state, 'candidate');
   assert.equal(save.runtime.length, 0);
   registry = fresh();
-  const newInputs = { author: 'Albert Einstein', tag: 'music' };
+  const newInputs = { page: 3 };
   const use = await call('candidate-real-use', {
     action: 'recipe',
     recipeId: draft.id,
     inputs: newInputs,
   });
   assert.equal(use.result.ok, true);
-  assert.equal(use.result.output.matched, true);
-  assert.equal(use.result.output.tag, 'music');
+  assert.equal(use.result.output.records.length, 2);
+  assert(use.result.output.records.every((row) => row.text && row.author));
   assert.equal((await readRecipes()).get(draft.id).validation.state, 'active');
   report.checks.candidateSavedWithoutReplayAndPromotedNextSession = true;
   report.experiences = await store.list('quotes.toscrape.com');
@@ -329,7 +308,7 @@ try {
   assert.equal((await readRecipes()).get(broken.id).validation.state, 'suspended');
   await call('repair-observe', {
     action: 'snapshot',
-    selector: 'form',
+    selector: 'body',
     refs: 'role',
     compact: true,
     maxChars: 3000,

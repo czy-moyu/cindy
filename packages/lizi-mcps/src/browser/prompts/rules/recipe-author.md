@@ -10,7 +10,7 @@
 4. **抽取**:扒 DOM 字段用 `extract`——**先 scoped `snapshot` 确认选择器在页面上真实存在再写**(别凭空猜选择器、别把属性拼进选择器)。`fields` 的 string 是纯 CSS 选择器(取 textContent),取属性用 `{selector, attr}`,取链接用 `{selector, type:"href"}`。列表用 `from` + `multiple`。
 5. **交互步**:`click` / `type` / `select` 直接写**稳定 CSS `selector`**(运行时由 act 解析,不写死 snapshot ref,跨会话不腐烂)。`type` 配 `submit: true` 提交表单。
 6. **验证**:用 `action:"recipe", site, recipeDraft, inputs` 当场试跑。交互和读取步骤须有 `guard:{url,selector?,text?}`：完整 URL 精确匹配，标准 CSS selector 须唯一可见匹配，可选 text 精确匹配（去首尾空格）。URL 应包含账号/项目身份；同 URL 多账号时用页面账号元素校验。最后一步须带 `expect:{minCount?,requiredFields?,equals?}`，用 `as` 和 `output:"{{变量}}"` 返回经过验证的结果。expect 检查每条记录的顶层字段，equals 的字符串可插值。guard/expect 不可 optional。
-7. **沉淀**:`action: "saveRecipe"`,传 `site` + `recipeDraft` + 可选 `siteGuideDraft`。通常保存本任务中刚试跑成功的同一份 draft、site 和 profile；不要提供宿主管理的 validation 字段。新只读流程声明 `access:"read"` 后可加 `deferValidation:true`，不重新跑当前任务，先存 candidate，等下一次真实任务显式执行并通过所有 guard/expect 后转为 active。候选不能覆盖已有配方，写流程不能延后验证。每站可保存多个 id。
+7. **沉淀**:`action: "saveRecipe"`,传 `site` + `recipeDraft` + 可选 `siteGuideDraft`。通常保存本任务中刚试跑成功的同一份 draft、site 和 profile；不要提供宿主管理的 validation 字段。新流程声明 `access:"read"` 且仅含 `navigate`、无 `fn` 的 `wait`、`extract`、`requests`、`responseBody` 时，可加 `deferValidation:true`，不重新跑当前任务，先存 candidate，等下一次真实任务显式执行并通过所有 guard/expect 后转为 active。交互、`evaluate`、脚本或 adapter 不能凭 read 标签延后验证，须在当次真实操作中验证；不为测试重放写操作。候选不能覆盖已有配方。每站可保存多个 id。
 
 验证用少量组合输入覆盖变化的参数、数量和空结果；优先使用下一次真实需求，不穷举、不承诺未测能力。active 仅证明已执行的检查通过，不代表所有输入都测试过。账号/项目的页面身份必须进入 guard，不能仅靠 profile 或站点名称推断登录身份。参数化所有业务值，不保存实际查询、用户资料、密码或令牌；普通记录只用于判断是否重复，不自动上传或转成内置配方。
 

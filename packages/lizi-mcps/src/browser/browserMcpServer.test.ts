@@ -54,10 +54,42 @@ describe('browser experience cache', () => {
   const draft: Recipe = { id: 'experience-search', access: 'read', match: ['experience.test'], description: 'Search books',
     inputs: { query: { required: true } }, steps: [{ action: 'evaluate', fn: '() => ({title: "found"})',
       guard: { url: 'https://experience.test/' }, expect: { requiredFields: ['title'] }, as: 'items' }], output: '{{items}}' };
+  const readDraft: Recipe = { ...draft, steps: [{ action: 'extract', extract: { fields: { title: 'h1' } },
+    guard: { url: 'https://experience.test/' }, expect: { requiredFields: ['title'] }, as: 'items' }] };
+  const extracted = { ok: true, count: 1, records: [{ title: 'found' }] };
+
+  // Review regression, unit/MCP entry: metadata cannot authorize deferred
+  // mutations. Old coverage only rejected access=write, not mislabeled steps.
+  it.each([
+    { action: 'click' as const, selector: '#submit' },
+    { action: 'type' as const, selector: '#input', value: 'fake-value' },
+    { action: 'select' as const, selector: '#choice', values: ['fake-value'] },
+    { action: 'evaluate' as const, fn: "() => fetch('/write', {method:'POST'})" },
+    { action: 'wait' as const, fn: "() => { document.querySelector('form').submit(); return true; }" },
+  ])('rejects deferred $action capabilities at save, discovery and persisted execution', async step => {
+    const unsafe: Recipe = { ...readDraft, id: `unsafe-deferred-${step.action}`,
+      steps: [{ ...step, guard: { url: 'https://experience.test/' } }, ...readDraft.steps] };
+    let loaded: Recipe | undefined;
+    let saves = 0;
+    const h = await makeHarness({
+      getUserRecipes: async () => ({ version: `unsafe-deferred-${step.action}-${Boolean(loaded)}`,
+        recipes: new Map(loaded ? [[loaded.id, loaded]] : []), siteGuides: new Map() }),
+      saveUserRecipe: async () => { saves++; return { ok: true }; },
+    });
+    try {
+      expect((await invoke(h, { action: 'saveRecipe', site: 'experience.test', recipeDraft: unsafe, deferValidation: true })).ok).toBe(false);
+      expect(saves).toBe(0);
+      loaded = { ...unsafe, validation: { site: 'experience.test', state: 'candidate' } };
+      expect((await invoke(h, { action: 'siteguide', site: 'experience.test', intent: 'Search' })).recipes).toEqual([]);
+      expect((await invoke(h, { action: 'recipe', recipeId: unsafe.id, inputs: { query: 'book' } })).ok).toBe(false);
+      expect(h.calls).toHaveLength(0);
+    } finally { await h.cleanup(); }
+  });
 
   // Review regression, unit/MCP entry: omitted and explicit profile names must
   // refer to the same host identity; changing the default must not widen scope.
   it.each([true, false])('binds learned recipes to the resolved host profile (deferred=%s)', async deferred => {
+    const recipe = deferred ? readDraft : draft;
     let profile = 'Cindy';
     let stored: Recipe | undefined;
     let version = 0;
@@ -66,7 +98,7 @@ describe('browser experience cache', () => {
       getUserRecipes: async () => ({ version: `resolved-profile-${deferred}-${version}`,
         recipes: new Map(stored ? [[stored.id, stored]] : []), siteGuides: new Map() }),
       saveUserRecipe: async ({ recipe }) => { stored = recipe; version++; return { ok: true }; },
-    }, (_req, i) => ({ targetId: 'tab', result: i % 2 === 0 ? true : { title: 'found' } }));
+    }, (_req, i) => ({ targetId: 'tab', result: deferred ? { matched: true, value: extracted } : i % 2 === 0 ? true : { title: 'found' } }));
     try {
       if (!deferred) {
         expect((await invoke(h, { action: 'recipe', site: 'experience.test', recipeDraft: draft,
@@ -75,7 +107,7 @@ describe('browser experience cache', () => {
         expect((await invoke(h, { action: 'saveRecipe', site: 'experience.test', recipeDraft: draft })).ok).toBe(false);
         profile = 'Cindy';
       }
-      expect((await invoke(h, { action: 'saveRecipe', site: 'experience.test', recipeDraft: draft,
+      expect((await invoke(h, { action: 'saveRecipe', site: 'experience.test', recipeDraft: recipe,
         profile: 'Cindy', deferValidation: deferred })).ok).toBe(true);
       expect(stored?.validation?.profile).toBe('Cindy');
       expect((await invoke(h, { action: 'siteguide', site: 'experience.test', intent: 'Search' })).recipes).toHaveLength(1);
@@ -191,6 +223,7 @@ describe('browser experience cache', () => {
   });
 
   it('persists a read candidate without replay and promotes it on a later real invocation', async () => {
+    const draft = readDraft;
     let stored: Recipe | undefined;
     let version = 0;
     const deps: Partial<BrowserMcpDeps> = {
@@ -205,23 +238,24 @@ describe('browser experience cache', () => {
       expect((await invoke(h, { action: 'saveRecipe', site: 'experience.test', recipeDraft: draft, deferValidation: true })).ok).toBe(false);
       expect((await invoke(h, { action: 'saveRecipe', site: 'experience.test', recipeDraft: { ...draft, id: 'write', access: 'write' }, deferValidation: true })).ok).toBe(false);
     } finally { await h.cleanup(); }
-    const next = await makeHarness(deps, (_req, i) => ({ result: i === 0 ? true : { title: 'found' } }));
+    const next = await makeHarness(deps, () => ({ result: { matched: true, value: extracted } }));
     try {
       expect((await invoke(next, { action: 'recipe', recipeId: draft.id, profile: 'other', inputs: { query: 'book' } })).ok).toBe(false);
       expect((await invoke(next, { action: 'recipe', recipeId: draft.id })).ok).toBe(false);
       expect(next.calls).toHaveLength(0);
-      expect((await invoke(next, { action: 'recipe', recipeId: draft.id, inputs: { query: 'book' } })).output).toEqual({ title: 'found' });
-      expect(next.calls).toHaveLength(2);
+      expect((await invoke(next, { action: 'recipe', recipeId: draft.id, inputs: { query: 'book' } })).output).toEqual(extracted);
+      expect(next.calls).toHaveLength(1);
       expect(stored?.validation?.state).toBe('active');
     } finally { await next.cleanup(); }
   });
 
   it.each(['guard', 'save'] as const)('keeps candidate %s failures honest without replay', async failure => {
+    const draft = readDraft;
     let stored: Recipe = { ...draft, validation: { site: 'experience.test', state: 'candidate', profile: '' } };
     const h = await makeHarness({
       getUserRecipes: async () => ({ version: `experience-failure-${failure}`, recipes: new Map([[stored.id, stored]]), siteGuides: new Map() }),
       saveUserRecipe: async ({ recipe }) => { if (failure === 'save') throw new Error('disk full'); stored = recipe; return { ok: true }; },
-    }, (_req, i) => ({ result: i === 0 ? failure !== 'guard' : { title: 'found' } }));
+    }, () => ({ result: { matched: failure !== 'guard', value: extracted } }));
     try {
       const result = await invoke(h, { action: 'recipe', recipeId: draft.id, inputs: { query: 'book' } });
       if (failure === 'guard') {
@@ -233,7 +267,7 @@ describe('browser experience cache', () => {
         expect(result.ok).toBe(true);
         expect(result.maintenanceMessage).toContain('保存失败');
         expect(stored.validation?.state).toBe('candidate');
-        expect(h.calls).toHaveLength(2);
+        expect(h.calls).toHaveLength(1);
       }
     } finally { await h.cleanup(); }
   });

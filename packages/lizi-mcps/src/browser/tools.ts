@@ -27,6 +27,7 @@ import {
   mergeSiteGuides,
   RecipeSchema,
   SiteGuideSchema,
+  deferredRecipeIssue,
   type MergedRecipe,
   type MergedSiteGuide,
   type Recipe,
@@ -558,7 +559,7 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
     inputShape: {
       action: z.enum(ACTIONS).describe('浏览器操作类型'),
       intent: z.string().max(120).optional().describe('open/navigate/siteguide: 可选操作意图，用于本地匹配配方；不会自动执行'),
-      deferValidation: z.boolean().optional().describe('saveRecipe: 将新的只读流程存为候选，下一次真实任务执行时校验；不额外重放当前任务'),
+      deferValidation: z.boolean().optional().describe('saveRecipe: 仅明确读取步骤的新流程可存候选，下次真实任务校验；交互和任意脚本须当次验证，不为测试重放写操作'),
       resultId: z.string().optional().describe('readResult: 大结果返回的 fullResult.id'),
       offset: z.number().int().nonnegative().optional().describe('readResult: 原始 JSON 字符偏移'),
       backend: z
@@ -811,8 +812,8 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
           if (!entry) return errorResult('recipe', `unknown recipe: ${args.recipeId}`);
           if (entry.recipe.validation?.state === 'candidate') {
             const { validation, ...draft } = entry.recipe;
-            const issue = draftIssue(draft, validation.site);
-            if (issue || draft.access !== 'read') return errorResult('recipe', issue ?? '候选必须是只读流程');
+            const issue = draftIssue(draft, validation.site) ?? deferredRecipeIssue(draft);
+            if (issue) return errorResult('recipe', issue);
           }
           const id = entry.recipe.id;
           const persisted = candidate ? (await recipeRegistry(deps)).get(id)?.recipe : entry.recipe;
@@ -1072,7 +1073,8 @@ export function registerBrowserTools(registry: BrowserToolRegistry, deps: Browse
           if (issue) return errorResult('saveRecipe', issue);
           const verified = verifiedDrafts.get(parsed.data.id);
           if (args.deferValidation) {
-            if (parsed.data.access !== 'read') return errorResult('saveRecipe', '延后验证仅支持声明为 read 的新流程；写操作沿用当次授权和已执行验证');
+            const deferredIssue = deferredRecipeIssue(parsed.data);
+            if (deferredIssue) return errorResult('saveRecipe', deferredIssue);
             if ((await recipeRegistry(deps)).has(parsed.data.id)) return errorResult('saveRecipe', '已有配方必须先验证修订，不能被未验证候选覆盖');
           } else if (!verified || verified.site !== args.site || verified.content !== JSON.stringify(parsed.data) || verified.profile !== (args.profile ?? '')) {
             return errorResult('saveRecipe', '请先用 action=recipe、site、相同 recipeDraft 试跑并通过校验；不能保存未验证或已改动的配方');

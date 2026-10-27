@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { MergedRecipe } from './recipe-loader.js';
+import { deferredRecipeIssue, type MergedRecipe } from './recipe-loader.js';
 
 /** Persist only execution shape and counters, never URLs, selectors, scripts or values. */
 export const BrowserExperienceSchema = z.object({
@@ -73,6 +73,7 @@ export function suggestRecipes(
   return [...recipes.values()]
     .filter(({ recipe }) => {
       if (recipe.validation?.state === 'suspended') return false;
+      if (recipe.validation?.state === 'candidate' && deferredRecipeIssue(recipe)) return false;
       if (recipe.validation?.profile !== undefined && recipe.validation.profile !== profile)
         return false;
       return [recipe.validation?.site, ...(recipe.match ?? [])].some((host) => {
