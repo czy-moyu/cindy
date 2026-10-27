@@ -8,6 +8,8 @@
  */
 
 import type {
+  AgentKind,
+  OneShotOptions,
   ToolLoopEvidence,
   ToolLoopReviewDecision,
   ToolLoopReviewer,
@@ -17,6 +19,7 @@ import { redactSensitiveText } from '@cindy/maker-shared/error-redaction';
 
 import { redactSecrets } from '../git-snapshot/secretRedactor.js';
 import type { requestUtilityText } from '../utility-model/oneShotCandidates.js';
+import type { AuxiliaryModelChainSource } from '../utility-model/resolveAuxiliaryModelChain.js';
 
 const TOOL_LOOP_REVIEW_TIMEOUT_MS = 15_000;
 /** 每段输入/输出发送给辅助模型的最大长度(脱敏之后再截断)。 */
@@ -42,19 +45,83 @@ type RequestText = (
   opts: Parameters<typeof requestUtilityText>[2],
 ) => ReturnType<typeof requestUtilityText>;
 
+type ReviewTextOptions = NonNullable<Parameters<RequestText>[1]>;
+
+/** 复核只关心有没有拿到回答;任务 Agent 的 one-shot 不带路由元数据。 */
+type ReviewTextResult = { ok: true; text: string } | { ok: false; reason: string };
+
+type RequestTaskRouteText = (
+  request: ToolLoopReviewRequest,
+  prompt: string,
+  opts: ReviewTextOptions,
+) => Promise<ReviewTextResult> | null;
+
 interface ToolLoopReviewerDeps {
   /** 共享辅助模型链。 */
   requestText: RequestText;
   /**
    * 辅助模型链没有任何可用候选(no_candidate,例如停用了 Cindy AI、只连了自己的模型账号)时,
-   * 改用被复核任务自己的模型路线;证据本就出自这条路线,不会送往新的服务方。
-   * 返回 null = 不允许回落,按 stop 处理。
+   * 改用被复核任务自己的路线(见 createToolLoopTaskRoute)。返回 null = 不允许回落,按 stop 处理。
    */
-  requestSessionRouteText?: (
-    request: ToolLoopReviewRequest,
-    prompt: string,
-    opts: Parameters<RequestText>[1],
-  ) => ReturnType<RequestText> | null;
+  requestSessionRouteText?: RequestTaskRouteText;
+}
+
+/** 任务路线回落依赖的运行期能力,由 maker-host 注入。 */
+export interface ToolLoopTaskRouteDeps {
+  requestText: RequestText;
+  /** 当前有效辅助链的来源与快照;快照用于派发前确认设置没有改过。 */
+  auxiliaryChain: () => { source: AuxiliaryModelChainSource; snapshot: string };
+  ownerScope: () => string;
+  sessionBoundaryPending: () => boolean;
+  sessionProvider: (sessionId: string) => string | null;
+  agentSupportsOneShot: (agentKind: AgentKind) => boolean;
+  agentOneShotRouteDisabled: (agentKind: AgentKind) => Promise<boolean>;
+  agentOneShot: (agentKind: AgentKind, prompt: string, opts: OneShotOptions) => Promise<string>;
+}
+
+/**
+ * 辅助链没有可用候选时的任务路线:先按任务的来源 + 模型直连(证据本就出自这条路线);直连也没有
+ * 候选(如 Claude 订阅,Cindy 进程不借用其凭证)时,改用任务所在 Agent 的 one-shot,与自动起标题
+ * 同口径。只在自动链下回落:自定义/环境变量链是明确的路由决定,保持 fail-closed;每次派发前重验
+ * owner 与辅助链快照,期间改了设置就放弃。
+ */
+export function createToolLoopTaskRoute(deps: ToolLoopTaskRouteDeps): RequestTaskRouteText {
+  return (request, prompt, opts) => {
+    const chain = deps.auxiliaryChain();
+    if (chain.source !== 'auto') return null;
+    const ownerScope = deps.ownerScope();
+    const stillCurrent = (): boolean => !deps.sessionBoundaryPending()
+      && deps.ownerScope() === ownerScope
+      && deps.auxiliaryChain().snapshot === chain.snapshot;
+    return (async (): Promise<ReviewTextResult> => {
+      const providerId = deps.sessionProvider(request.sessionId);
+      const direct = await deps.requestText(prompt, {
+        ...opts,
+        agentKind: request.agentKind,
+        model: request.model,
+        ...(providerId ? { providerId } : {}),
+        beforeDispatch: async () => stillCurrent(),
+      });
+      if (direct.ok || direct.reason !== 'no_candidate' || opts.signal?.aborted) return direct;
+      if (!deps.agentSupportsOneShot(request.agentKind)) return direct;
+      const beforeAgentDispatch = async (): Promise<boolean> =>
+        stillCurrent() && !(await deps.agentOneShotRouteDisabled(request.agentKind)) && stillCurrent();
+      if (!(await beforeAgentDispatch())) return direct;
+      try {
+        const text = (await deps.agentOneShot(request.agentKind, prompt, {
+          maxTokens: opts.maxTokens,
+          timeoutMs: opts.timeoutMs,
+          signal: opts.signal,
+          systemPrompt: opts.systemPrompt,
+          responseInstructions: opts.responseInstructions,
+          beforeDispatch: beforeAgentDispatch,
+        })).trim();
+        return text ? { ok: true, text } : direct;
+      } catch {
+        return direct;
+      }
+    })();
+  };
 }
 
 /** URL 中内嵌的凭证(scheme://user:pass@host、scheme://token@host)。 */
@@ -180,7 +247,7 @@ export function parseToolLoopReviewDecision(text: string): ToolLoopReviewDecisio
 export function createToolLoopReviewer(deps: ToolLoopReviewerDeps): ToolLoopReviewer {
   return async (request, { signal }) => {
     const prompt = buildToolLoopReviewPrompt(request);
-    const opts: Parameters<RequestText>[1] = {
+    const opts: ReviewTextOptions = {
       maxTokens: TOOL_LOOP_REVIEW_MAX_TOKENS,
       timeoutMs: TOOL_LOOP_REVIEW_TIMEOUT_MS,
       disableReasoning: true,
@@ -189,7 +256,7 @@ export function createToolLoopReviewer(deps: ToolLoopReviewerDeps): ToolLoopRevi
       responseInstructions: RESPONSE_INSTRUCTIONS,
       validateResponse: (text) => parseToolLoopReviewDecision(text) !== null,
     };
-    let result = await deps.requestText(prompt, opts);
+    let result: ReviewTextResult = await deps.requestText(prompt, opts);
     // 只在“链上一个可用模型都没有”时回落;候选失败/超时说明链本身可用,不换路线重发。
     if (!result.ok && result.reason === 'no_candidate' && !signal.aborted) {
       result = await deps.requestSessionRouteText?.(request, prompt, opts) ?? result;

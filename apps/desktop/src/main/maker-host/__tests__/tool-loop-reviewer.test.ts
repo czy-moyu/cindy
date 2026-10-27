@@ -7,7 +7,9 @@ import {
   TOOL_LOOP_REVIEW_SYSTEM_PROMPT,
   buildToolLoopReviewPrompt,
   createToolLoopReviewer,
+  createToolLoopTaskRoute,
   parseToolLoopReviewDecision,
+  type ToolLoopTaskRouteDeps,
   scrubToolLoopEvidence,
 } from '../tool-loop-reviewer.js';
 
@@ -212,27 +214,68 @@ describe('tool loop reviewer', () => {
   });
 
   // 停用 Cindy AI 后自动辅助链全部 no_candidate:复核从未真正发生,疑似一律中断(#6929)。
-  it('reviews on the task route only when the auxiliary chain has no candidate', async () => {
-    const noCandidate = async (): Promise<UtilityTextResult> => ({ ok: false, reason: 'no_candidate', attempts: [] });
+  describe('task route when the auxiliary chain has no candidate', () => {
+    const noCandidate: UtilityTextResult = { ok: false, reason: 'no_candidate', attempts: [] };
+    function setup(opts: { direct?: UtilityTextResult; source?: 'auto' | 'custom' } = {}) {
+      const state = { source: opts.source ?? 'auto', refs: 'a' };
+      const auxiliary = vi.fn(async (): Promise<UtilityTextResult> => noCandidate);
+      const direct = vi.fn<ToolLoopTaskRouteDeps['requestText']>(async (_prompt, options) =>
+        (await options?.beforeDispatch?.({ providerId: 'my-gateway', agentKind: 'codex', model: 'gpt-test' })) === false
+          ? noCandidate
+          : opts.direct ?? okResult('CONTINUE'));
+      const agentOneShot = vi.fn(async () => 'CONTINUE');
+      const route = createToolLoopTaskRoute({
+        requestText: direct,
+        auxiliaryChain: () => ({ source: state.source, snapshot: `${state.source}:${state.refs}` }),
+        ownerScope: () => 'owner-a',
+        sessionBoundaryPending: () => false,
+        sessionProvider: () => 'my-gateway',
+        agentSupportsOneShot: () => true,
+        agentOneShotRouteDisabled: async () => false,
+        agentOneShot,
+      });
+      const reviewer = createToolLoopReviewer({ requestText: auxiliary, requestSessionRouteText: route });
+      return { state, auxiliary, direct, agentOneShot, reviewer };
+    }
     const signal = new AbortController().signal;
-    const sessionRoute = vi.fn(async () => okResult('CONTINUE'));
-    const reviewer = createToolLoopReviewer({ requestText: vi.fn(noCandidate), requestSessionRouteText: sessionRoute });
-    await expect(reviewer(request, { signal })).resolves.toBe('continue');
-    expect(sessionRoute).toHaveBeenCalledWith(request, expect.stringContaining('<tool_calls>'), expect.objectContaining({
-      systemPrompt: TOOL_LOOP_REVIEW_SYSTEM_PROMPT,
-      signal,
-    }));
 
-    const disallowed = createToolLoopReviewer({ requestText: vi.fn(noCandidate), requestSessionRouteText: () => null });
-    await expect(disallowed(request, { signal })).resolves.toBe('stop');
-
-    // 链上有候选但调用失败:不换路线重发。
-    const chainFailed = vi.fn(async () => okResult('CONTINUE'));
-    const failing = createToolLoopReviewer({
-      requestText: vi.fn(async (): Promise<UtilityTextResult> => ({ ok: false, reason: 'all_candidates_failed', attempts: [] })),
-      requestSessionRouteText: chainFailed,
+    it('reviews on the task provider and model', async () => {
+      const { direct, agentOneShot, reviewer } = setup();
+      await expect(reviewer(request, { signal })).resolves.toBe('continue');
+      expect(direct).toHaveBeenCalledWith(expect.stringContaining('<tool_calls>'), expect.objectContaining({
+        agentKind: 'codex', model: 'gpt-test', providerId: 'my-gateway', systemPrompt: TOOL_LOOP_REVIEW_SYSTEM_PROMPT,
+      }));
+      expect(agentOneShot).not.toHaveBeenCalled();
     });
-    await expect(failing(request, { signal })).resolves.toBe('stop');
-    expect(chainFailed).not.toHaveBeenCalled();
+
+    it('uses the task agent one-shot when the task route cannot be called directly (Claude subscription)', async () => {
+      const { agentOneShot, reviewer } = setup({ direct: noCandidate });
+      await expect(reviewer(request, { signal })).resolves.toBe('continue');
+      expect(agentOneShot).toHaveBeenCalledWith('codex', expect.stringContaining('<tool_calls>'), expect.objectContaining({
+        systemPrompt: TOOL_LOOP_REVIEW_SYSTEM_PROMPT, signal,
+      }));
+    });
+
+    it('stays fail-closed for custom chains, settings changed mid-request, and failing candidates', async () => {
+      const custom = setup({ source: 'custom' });
+      await expect(custom.reviewer(request, { signal })).resolves.toBe('stop');
+      expect(custom.direct).not.toHaveBeenCalled();
+
+      // 回落请求等待期间用户改了辅助模型设置:任务路线和 Agent one-shot 都不再派发。
+      const switched = setup();
+      switched.direct.mockImplementationOnce(async (_prompt, options) => {
+        switched.state.refs = 'b';
+        const allowed = await options?.beforeDispatch?.({ providerId: 'my-gateway', agentKind: 'codex', model: 'gpt-test' });
+        return allowed === false ? noCandidate : okResult('CONTINUE');
+      });
+      await expect(switched.reviewer(request, { signal })).resolves.toBe('stop');
+      expect(switched.agentOneShot).not.toHaveBeenCalled();
+
+      // 链上有候选但调用失败:不换路线重发。
+      const failing = setup();
+      failing.auxiliary.mockResolvedValueOnce({ ok: false, reason: 'all_candidates_failed', attempts: [] });
+      await expect(failing.reviewer(request, { signal })).resolves.toBe('stop');
+      expect(failing.direct).not.toHaveBeenCalled();
+    });
   });
 });
